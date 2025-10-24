@@ -3,10 +3,11 @@ import threading
 import time
 from datetime import datetime
 import requests
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
 
+# ------------------ CONFIG ------------------
 RESTAURANTS = {
     "Bolt": [
         {"name": "Burgers Militari", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
@@ -32,87 +33,139 @@ RESTAURANTS = {
     ]
 }
 
-STATUS = {}
-LAST_CHECK = None
+CHECK_INTERVAL = 60  # secunde
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Accept-Language": "ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7",
+}
 
-def check_restaurant_status():
+STATUS = {}         # {platform: [ {...}, ... ]}
+LAST_CHECK = None   # timestamp string
+
+# ------------------ CORE ------------------
+def ping(url: str) -> str:
+    """Returnează '🟢 Deschis', '🔴 Închis (cod)', sau '❌ Eroare: ...'."""
+    try:
+        r = requests.get(url, headers=HEADERS, timeout=12)
+        if r.status_code == 200:
+            return "🟢 Deschis"
+        return f"🔴 Închis ({r.status_code})"
+    except Exception as e:
+        return f"❌ Eroare: {str(e)[:90]}"
+
+def check_once():
     global STATUS, LAST_CHECK
-    new_status = {}
-    for platform, restaurants in RESTAURANTS.items():
-        new_status[platform] = []
-        for r in restaurants:
-            try:
-                resp = requests.get(r["url"], timeout=10)
-                if resp.status_code == 200:
-                    st = "🟢 Deschis"
-                else:
-                    st = f"🔴 Închis ({resp.status_code})"
-            except Exception as e:
-                st = f"❌ Eroare: {e}"
-            new_status[platform].append({
-                "name": r["name"],
-                "url": r["url"],
+    print("[monitor] încep verificarea…", flush=True)
+    new = {}
+    for platform, items in RESTAURANTS.items():
+        lst = []
+        for it in items:
+            st = ping(it["url"])
+            lst.append({
+                "name": it["name"],
+                "url": it["url"],
                 "status": st,
-                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             })
-    STATUS = new_status
+            time.sleep(0.5)  # polite
+        new[platform] = lst
+    STATUS = new
     LAST_CHECK = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print("[monitor] verificare terminată la", LAST_CHECK, flush=True)
 
-def background_checker():
+def background_loop():
     while True:
-        check_restaurant_status()
-        time.sleep(60)
+        check_once()
+        time.sleep(CHECK_INTERVAL)
 
-threading.Thread(target=background_checker, daemon=True).start()
+# rulează o verificare imediat după import (nu blochează importul)
+def _bootstrap():
+    threading.Thread(target=check_once, daemon=True).start()
+    threading.Thread(target=background_loop, daemon=True).start()
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html>
+_bootstrap()
+
+# ------------------ UI ------------------
+TEMPLATE = """
+<!doctype html>
+<html lang="ro">
 <head>
-    <meta charset="utf-8">
-    <title>Status Restaurante</title>
-    <meta http-equiv="refresh" content="30">
-    <style>
-        body { font-family: Arial; background: #111; color: #eee; text-align: center; }
-        table { margin: 20px auto; border-collapse: collapse; width: 80%; }
-        th, td { border: 1px solid #333; padding: 8px; }
-        th { background: #222; }
-        a { color: #4fa3ff; text-decoration: none; }
-        .ok { color: #00ff00; }
-        .err { color: #ff5555; }
-    </style>
+<meta charset="utf-8">
+<title>📊 Status restaurante (Wolt / Bolt)</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="30">
+<style>
+  :root{color-scheme:dark light;}
+  body{background:#101214;color:#e6e6e6;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:28px;text-align:center}
+  h1{margin:0 0 6px}
+  .meta{color:#9aa0a6;margin-bottom:14px}
+  .wrap{max-width:1100px;margin:0 auto}
+  table{width:100%;border-collapse:collapse;margin:16px 0}
+  th,td{border:1px solid #2b2f36;padding:10px}
+  th{background:#171a1f}
+  a{color:#8ab4f8;text-decoration:none}
+  .ok{color:#34a853;font-weight:700}
+  .bad{color:#ea4335;font-weight:700}
+  .err{color:#fbbc05;font-weight:700}
+  .btn{display:inline-block;padding:8px 14px;border-radius:10px;border:1px solid #2b2f36;margin-top:6px;cursor:pointer}
+</style>
+<script>
+async function refreshNow(btn){
+  btn.disabled = true; btn.innerText = 'Se verifică...';
+  try{
+    const r = await fetch('/refresh', {method:'POST'});
+    const j = await r.json();
+    btn.innerText = 'Reverifică acum';
+    btn.disabled = false;
+    location.reload();
+  }catch(e){
+    btn.innerText = 'Reverifică acum';
+    btn.disabled = false;
+    alert('Eroare la refresh');
+  }
+}
+</script>
 </head>
 <body>
-<h2>📊 Status restaurante (Wolt / Bolt)</h2>
-<p>Ultima verificare completă: {{ last_check or "în curs…" }} • Auto-refresh la 30s • Interval verificare: 60s</p>
-{% for platform, restaurants in status.items() %}
-<h3>{{ platform }}</h3>
-<table>
-<tr><th>Restaurant</th><th>Status</th><th>Verificat la</th></tr>
-{% for r in restaurants %}
-<tr>
-<td><a href="{{ r.url }}" target="_blank">{{ r.name }}</a></td>
-<td>{{ r.status }}</td>
-<td>{{ r.checked_at }}</td>
-</tr>
-{% endfor %}
-</table>
-{% endfor %}
+<div class="wrap">
+  <h1>📊 Status restaurante (Wolt / Bolt)</h1>
+  <div class="meta">Ultima verificare completă: <b>{{ last or "în curs…" }}</b> • Auto-refresh 30s • Interval verificare: {{ interval }}s</div>
+  <button class="btn" onclick="refreshNow(this)">Reverifică acum</button>
+
+  {% for platform, rows in status.items() %}
+    <h2 style="margin-top:22px">{{ platform }}</h2>
+    <table>
+      <tr><th>Locație</th><th>Status</th><th>Verificat la</th></tr>
+      {% for r in rows %}
+        {% set cls = 'ok' if '🟢' in r.status else ('bad' if '🔴' in r.status else 'err') %}
+        <tr>
+          <td style="text-align:left"><a href="{{ r.url }}" target="_blank">{{ r.name }}</a></td>
+          <td class="{{ cls }}">{{ r.status }}</td>
+          <td>{{ r.checked_at }}</td>
+        </tr>
+      {% endfor %}
+    </table>
+  {% endfor %}
+</div>
 </body>
 </html>
 """
 
 @app.route("/")
 def index():
-    return render_template_string(HTML_TEMPLATE, status=STATUS, last_check=LAST_CHECK)
+    # dacă încă nu a rulat nimic, arătăm pagină „goală” dar cu meta
+    return render_template_string(TEMPLATE, status=STATUS, last=LAST_CHECK, interval=CHECK_INTERVAL)
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({
-        "last_check": LAST_CHECK,
-        "status": STATUS
-    })
+    return jsonify({"last_check": LAST_CHECK, "interval": CHECK_INTERVAL, "status": STATUS})
+
+@app.route("/refresh", methods=["POST"])
+def refresh():
+    threading.Thread(target=check_once, daemon=True).start()
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
+    # în dev local; pe Render rulează cu gunicorn
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
