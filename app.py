@@ -2,16 +2,21 @@ import os
 import threading
 import time
 import re
+import html as html_lib
 import unicodedata
 from datetime import datetime
 
 import requests
-from bs4 import BeautifulSoup
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
-# ------------------ CONFIG ------------------
+# ================== META / VERSION ==================
+# Schimbă aici când faci un „release”.
+# Ex.: "v0.1 beta", apoi "v0.1.1", "v0.1.2" etc.
+VERSION = os.getenv("APP_VERSION", "v0.1.1")
+
+# ================== CONFIG ==================
 RESTAURANTS = {
     "Bolt": [
         {"name": "Burgers Militari",  "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
@@ -46,105 +51,105 @@ HEADERS = {
 STATUS = {}
 LAST_CHECK = None
 
-# ------------------ SORTING (burgers -> smash -> tacos) ------------------
+# ================== SORTING (burgers -> smash -> tacos) ==================
 def _norm(s: str) -> str:
-    # fără diacritice, lower
     return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
 
 def _category_index(name: str) -> int:
     n = _norm(name)
     if "burger" in n:
-        return 0   # Gorilla's Crazy Burgers
+        return 0
     if "smash" in n:
-        return 1   # Smash
+        return 1
     if "taco" in n:
-        return 2   # Tacos
-    return 3       # orice altceva (la final)
+        return 2
+    return 3
 
 def _sorted_items(items):
     return sorted(items, key=lambda it: (_category_index(it["name"]), _norm(it["name"])))
 
 
-# ------------------ DETECTION ------------------
-OPEN_PATTERNS = [
-    r'"is_open"\s*:\s*true',
-    r'"open"\s*:\s*true',
-    r'"availabilityStatus"\s*:\s*"open"',
-    r'\bdeschis\b', r'\bopen\b'
-]
+# ================== DETECTION (with reasons) ==================
+def _normalize_html_text(s: str) -> tuple[str, str]:
+    s = html_lib.unescape(s).lower().replace("\u00a0", " ")
+    s = re.sub(r"\s+", " ", s)
+    s_ascii = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+    return s, s_ascii
 
-CLOSED_PATTERNS = [
-    r'"is_open"\s*:\s*false',
-    r'"closed"\s*:\s*true',
-    r'"open"\s*:\s*false',
-    r'"availabilityStatus"\s*:\s*"closed"',
-    r'\bînchis\b', r'\binchis\b',
-    r'\bînchis\s+temporar\b', r'\binchis\s+temporar\b',
-    r'\btemporar\b',
-    r'\bdeschide\s+la\b',
-    r'\bopens\s+at\b', r'\bopening\s+at\b',
-    r'\bclosed\b', r'temporarily\s*closed'
-]
+def classify_with_reason(url: str, html: str) -> tuple[str, str]:
+    """
+    Returnează (status_emoji+text, motiv).
+    Status poate fi: '🔴 Închis', '🟢 Deschis', '🟡 Nedetectabil', '❌ Eroare: ...'
+    """
+    t, t_ascii = _normalize_html_text(html)
 
-def classify_from_html(url: str, html: str) -> str:
-    """Heuristici combinate pentru a decide OPEN/CLOSED/NONE pe Bolt/Wolt."""
-    t = html.lower()
+    # semnale generice de "închis"
+    closed_signals = [
+        (r'"availabilitystatus"\s*:\s*"closed"', "Bolt JSON availabilityStatus=closed"),
+        (r"\binchis temporar\b", "Bolt UI: „Închis temporar”"),
+        (r"\binchis\b", "Text „Închis”"),
+        (r"\btemporar(?:[^a-z]|$)", "Are cuvântul „temporar” lângă disponibilitate"),
+        (r"\btemporarily closed\b", "Text „temporarily closed”"),
+        (r"\bclosed\b", "Text „closed”"),
+    ]
+    opens_at_signals = [
+        (r"deschide la \d{1,2}[:.]\d{2}", "Bolt UI: „Deschide la HH:MM”"),
+        (r"opens at \d{1,2}[:.]\d{2}", "Text „Opens at HH:MM”"),
+    ]
 
-    # ---- Bolt ----
+    # ---- BOLT: closed-first ----
     if "bolt.eu" in url:
-        if re.search(r'"availabilitystatus"\s*:\s*"closed"', t):
-            return "🔴 Închis"
-        if re.search(r'"availabilitystatus"\s*:\s*"open"', t):
-            return "🟢 Deschis"
-        if "închis temporar" in t or "inchis temporar" in t:
-            return "🔴 Închis"
-        if re.search(r'deschide\s+la\s+\d{1,2}[:.]\d{2}', t) or re.search(r'opens\s+at\s+\d{1,2}[:.]\d{2}', t):
-            return "🔴 Închis"
+        for pat, why in closed_signals:
+            if re.search(pat, t) or re.search(pat, t_ascii):
+                return "🔴 Închis", why
+        for pat, why in opens_at_signals:
+            if re.search(pat, t) or re.search(pat, t_ascii):
+                return "🔴 Închis", why
+        return "🟡 Nedetectabil", "Bolt: niciun semnal clar (nici closed, nici opens-at)"
 
-    # ---- Wolt ----
+    # ---- WOLT ----
     if "wolt.com" in url:
         if re.search(r'"is_open"\s*:\s*false', t):
-            return "🔴 Închis"
+            return "🔴 Închis", "Wolt JSON is_open=false"
         if re.search(r'"is_open"\s*:\s*true', t):
-            return "🟢 Deschis"
-        if "închis" in t or "inchis" in t or "closed" in t:
-            return "🔴 Închis"
+            return "🟢 Deschis", "Wolt JSON is_open=true"
+        if re.search(r"\binchis\b", t) or re.search(r"\bclosed\b", t):
+            return "🔴 Închis", "Wolt text vizibil conține „închis/closed”"
+        return "🟡 Nedetectabil", "Wolt: niciun semnal clar (is_open absent)"
 
-    # ---- fallback generic ----
-    for pat in CLOSED_PATTERNS:
-        if re.search(pat, t):
-            return "🔴 Închis"
-    for pat in OPEN_PATTERNS:
-        if re.search(pat, t):
-            return "🟢 Deschis"
+    # ---- fallback pentru alte site-uri (nu ar trebui să ajungem aici) ----
+    if re.search(r"\bclosed\b", t) or re.search(r"\binchis\b", t):
+        return "🔴 Închis", "Text generic conține „closed/închis”"
+    if re.search(r'\bopen now\b', t) or re.search(r'\bdeschis acum\b', t):
+        return "🟢 Deschis", "Text generic conține „open now/deschis acum”"
+    return "🟡 Nedetectabil", "Fără semnale în HTML"
 
-    return "🟡 Nedetectabil"
-
-def fetch_status(url: str) -> str:
+def fetch_status_and_reason(url: str) -> tuple[str, str]:
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
         if r.status_code >= 400:
-            return f"🔴 Închis ({r.status_code})"
-        return classify_from_html(url, r.text)
+            return f"🔴 Închis ({r.status_code})", f"HTTP status {r.status_code}"
+        return classify_with_reason(url, r.text)
     except Exception as e:
-        return f"❌ Eroare: {str(e)[:90]}"
+        msg = str(e)[:140]
+        return f"❌ Eroare", f"Eroare rețea: {msg}"
 
 def check_once():
-    """Verifică toate restaurantele, actualizează STATUS & LAST_CHECK."""
     global STATUS, LAST_CHECK
     print("[monitor] start check...", flush=True)
     new = {}
     for platform, items in RESTAURANTS.items():
         lst = []
-        for it in _sorted_items(items):   # <-- sortăm aici
-            st = fetch_status(it["url"])
+        for it in _sorted_items(items):
+            st, why = fetch_status_and_reason(it["url"])
             lst.append({
                 "name": it["name"],
                 "url": it["url"],
                 "status": st,
+                "reason": why,
                 "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
-            time.sleep(0.5)  # politicos
+            time.sleep(0.5)
         new[platform] = lst
     STATUS = new
     LAST_CHECK = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -155,33 +160,36 @@ def background_loop():
         check_once()
         time.sleep(CHECK_INTERVAL)
 
-# rulează o verificare la import + loop periodic
+# rulează o verificare la import + loop periodic în background
 threading.Thread(target=check_once, daemon=True).start()
 threading.Thread(target=background_loop, daemon=True).start()
 
-# ------------------ UI ------------------
+# ================== UI ==================
 TEMPLATE = """
 <!doctype html>
 <html lang="ro">
 <head>
 <meta charset="utf-8">
-<title>📊 Status restaurante (Wolt / Bolt)</title>
+<title>📊 Status restaurante</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="30">
 <style>
   :root{color-scheme:dark light;}
-  body{background:#101214;color:#e6e6e6;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:28px;text-align:center}
+  body{background:#101214;color:#e6e6e6;font-family:system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;margin:28px;}
   h1{margin:0 0 6px}
   .meta{color:#9aa0a6;margin-bottom:14px}
-  .wrap{max-width:1100px;margin:0 auto}
+  .wrap{max-width:1200px;margin:0 auto}
+  .topbar{display:flex;gap:12px;align-items:center;justify-content:space-between}
+  .version{font-size:12px;color:#9aa0a6;border:1px solid #2b2f36;padding:4px 8px;border-radius:8px}
   table{width:100%;border-collapse:collapse;margin:16px 0}
-  th,td{border:1px solid #2b2f36;padding:10px}
+  th,td{border:1px solid #2b2f36;padding:10px;vertical-align:top}
   th{background:#171a1f}
   a{color:#8ab4f8;text-decoration:none}
   .ok{color:#34a853;font-weight:700}
   .bad{color:#ea4335;font-weight:700}
   .unk{color:#9aa0a6;font-weight:700}
-  .btn{display:inline-block;padding:8px 14px;border-radius:10px;border:1px solid #2b2f36;margin-top:6px;cursor:pointer}
+  .btn{display:inline-block;padding:8px 14px;border-radius:10px;border:1px solid #2b2f36;margin-top:6px;cursor:pointer;background:#15181d;color:#e6e6e6}
+  .reason{color:#cbd5e1;font-size:12px}
 </style>
 <script>
 async function refreshNow(btn){
@@ -195,19 +203,25 @@ async function refreshNow(btn){
 </head>
 <body>
 <div class="wrap">
-  <h1>📊 Status restaurante (Wolt / Bolt)</h1>
-  <div class="meta">Ultima verificare completă: <b>{{ last or "în curs…" }}</b> • Auto-refresh 30s • Interval verificare: {{ interval }}s</div>
-  <button class="btn" onclick="refreshNow(this)">Reverifică acum</button>
+  <div class="topbar">
+    <div>
+      <h1>📊 Status restaurante (Wolt / Bolt)</h1>
+      <div class="meta">Ultima verificare completă: <b>{{ last or "în curs…" }}</b> • Auto-refresh 30s • Interval verificare: {{ interval }}s</div>
+      <button class="btn" onclick="refreshNow(this)">Reverifică acum</button>
+    </div>
+    <div class="version">Versiune: {{ version }}</div>
+  </div>
 
   {% for platform, rows in status.items() %}
     <h2 style="margin-top:22px">{{ platform }}</h2>
     <table>
-      <tr><th>Locație</th><th>Status</th><th>Verificat la</th></tr>
+      <tr><th style="width:28%">Locație</th><th style="width:15%">Status</th><th style="width:37%">Motiv</th><th style="width:20%">Verificat la</th></tr>
       {% for r in rows %}
         {% set cls = 'ok' if '🟢' in r.status else ('bad' if '🔴' in r.status else 'unk') %}
         <tr>
           <td style="text-align:left"><a href="{{ r.url }}" target="_blank">{{ r.name }}</a></td>
           <td class="{{ cls }}">{{ r.status }}</td>
+          <td class="reason">{{ r.reason }}</td>
           <td>{{ r.checked_at }}</td>
         </tr>
       {% endfor %}
@@ -218,13 +232,20 @@ async function refreshNow(btn){
 </html>
 """
 
+# ================== ROUTES ==================
 @app.route("/")
 def index():
-    return render_template_string(TEMPLATE, status=STATUS, last=LAST_CHECK, interval=CHECK_INTERVAL)
+    return render_template_string(
+        TEMPLATE,
+        status=STATUS,
+        last=LAST_CHECK,
+        interval=CHECK_INTERVAL,
+        version=VERSION,
+    )
 
 @app.route("/api/status")
 def api_status():
-    return jsonify({"last_check": LAST_CHECK, "interval": CHECK_INTERVAL, "status": STATUS})
+    return jsonify({"last_check": LAST_CHECK, "interval": CHECK_INTERVAL, "status": STATUS, "version": VERSION})
 
 @app.route("/refresh", methods=["POST"])
 def refresh():
