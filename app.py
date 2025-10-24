@@ -1,13 +1,11 @@
 import os
-import re
-import time
 import threading
-import requests
-from bs4 import BeautifulSoup
+import time
 from datetime import datetime
+import requests
 from flask import Flask, jsonify, render_template_string
 
-# ================== CONFIG ==================
+app = Flask(__name__)
 
 RESTAURANTS = {
     "Bolt": [
@@ -34,150 +32,87 @@ RESTAURANTS = {
     ]
 }
 
-CHECK_INTERVAL_SECONDS = int(os.getenv("CHECK_INTERVAL_SECONDS", "60"))
+STATUS = {}
+LAST_CHECK = None
 
-HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                  "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128 Safari/537.36",
-    "Accept-Language": "ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7",
-}
-
-# ================== APP STATE ==================
-
-STATUS = {
-    # "platform|url": {
-    #   "platform": "...",
-    #   "url": "...",
-    #   "status": "OPEN/CLOSED/UNKNOWN/ERROR",
-    #   "checked_at": "YYYY-mm-dd HH:MM:SS",
-    #   "details": "text scurt"
-    # }
-}
-LAST_FULL_CHECK = None
-
-app = Flask(__name__)
-
-# ================== LOGIC ==================
-
-def classify_status(text: str) -> str:
-    t = text.lower()
-    # simple heuristics
-    if re.search(r"\b(închis|inchis|closed|temporarily\s*closed)\b", t):
-        return "CLOSED"
-    if re.search(r"\b(deschis|open|open\s*until)\b", t):
-        return "OPEN"
-    return "UNKNOWN"
-
-def fetch_status(url: str) -> tuple[str, str]:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        for tag in soup(["script", "style", "noscript"]):
-            tag.decompose()
-        text = soup.get_text(" ", strip=True)
-        return classify_status(text), "ok"
-    except Exception as e:
-        return "ERROR", str(e)[:120]
-
-def check_all():
-    global LAST_FULL_CHECK
-    for platform, urls in RESTAURANTS.items():
-        for url in urls:
-            st, details = fetch_status(url)
-            key = f"{platform}|{url}"
-            STATUS[key] = {
-                "platform": platform,
-                "url": url,
+def check_restaurant_status():
+    global STATUS, LAST_CHECK
+    new_status = {}
+    for platform, restaurants in RESTAURANTS.items():
+        new_status[platform] = []
+        for r in restaurants:
+            try:
+                resp = requests.get(r["url"], timeout=10)
+                if resp.status_code == 200:
+                    st = "🟢 Deschis"
+                else:
+                    st = f"🔴 Închis ({resp.status_code})"
+            except Exception as e:
+                st = f"❌ Eroare: {e}"
+            new_status[platform].append({
+                "name": r["name"],
+                "url": r["url"],
                 "status": st,
-                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "details": details,
-            }
-            time.sleep(0.6)  # fii prietenos cu site-urile
-    LAST_FULL_CHECK = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            })
+    STATUS = new_status
+    LAST_CHECK = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-def worker_loop():
-    # rulare continuă în fundal
+def background_checker():
     while True:
-        try:
-            check_all()
-        except Exception:
-            pass
-        time.sleep(CHECK_INTERVAL_SECONDS)
+        check_restaurant_status()
+        time.sleep(60)
 
-# pornește workerul când pornește aplicația
-threading.Thread(target=worker_loop, daemon=True).start()
+threading.Thread(target=background_checker, daemon=True).start()
 
-# ================== ROUTES ==================
-
-TEMPLATE = """
-<!doctype html>
-<html lang="ro">
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Status restaurante – Monitor</title>
-<style>
-  :root{color-scheme: light dark;}
-  body{font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:24px;}
-  h1{font-size:1.6rem;margin:0 0 8px;}
-  .meta{color:gray;margin-bottom:16px;}
-  .grid{display:grid;grid-template-columns:1fr;gap:12px;max-width:960px}
-  @media(min-width:700px){.grid{grid-template-columns:1fr 1fr}}
-  .card{border:1px solid #ddd;border-radius:14px;padding:16px;box-shadow:0 1px 4px rgba(0,0,0,.06);}
-  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
-  .url{word-break:break-all;font-size:.9rem;margin-top:6px}
-  .badge{padding:4px 10px;border-radius:999px;font-weight:600;font-size:.85rem}
-  .OPEN{background:#e6f4ea;color:#137333}
-  .CLOSED{background:#fde7e9;color:#b3261e}
-  .UNKNOWN{background:#eee;color:#444}
-  .ERROR{background:#ffe9cc;color:#8a4b00}
-  footer{margin-top:20px;color:gray;font-size:.9rem}
-</style>
-<meta http-equiv="refresh" content="30">
+    <meta charset="utf-8">
+    <title>Status Restaurante</title>
+    <meta http-equiv="refresh" content="30">
+    <style>
+        body { font-family: Arial; background: #111; color: #eee; text-align: center; }
+        table { margin: 20px auto; border-collapse: collapse; width: 80%; }
+        th, td { border: 1px solid #333; padding: 8px; }
+        th { background: #222; }
+        a { color: #4fa3ff; text-decoration: none; }
+        .ok { color: #00ff00; }
+        .err { color: #ff5555; }
+    </style>
 </head>
 <body>
-  <h1>📊 Status restaurante (Wolt / Glovo / Bolt)</h1>
-  <div class="meta">Ultima verificare completă: <b>{{ last }}</b> • Auto-refresh la 30s • Interval verificare: {{ interval }}s</div>
-  <div class="grid">
-    {% for item in items %}
-      <div class="card">
-        <div class="row">
-          <div><b>{{ item.platform }}</b></div>
-          <div class="badge {{ item.status }}">{{ item.status }}</div>
-        </div>
-        <div class="url">{{ item.url }}</div>
-        <div style="margin-top:8px;color:gray;font-size:.85rem">Verificat la {{ item.checked_at }} • {{ item.details }}</div>
-      </div>
-    {% endfor %}
-  </div>
-  <footer>
-    API: <a href="/api/status">/api/status</a>
-  </footer>
+<h2>📊 Status restaurante (Wolt / Bolt)</h2>
+<p>Ultima verificare completă: {{ last_check or "în curs…" }} • Auto-refresh la 30s • Interval verificare: 60s</p>
+{% for platform, restaurants in status.items() %}
+<h3>{{ platform }}</h3>
+<table>
+<tr><th>Restaurant</th><th>Status</th><th>Verificat la</th></tr>
+{% for r in restaurants %}
+<tr>
+<td><a href="{{ r.url }}" target="_blank">{{ r.name }}</a></td>
+<td>{{ r.status }}</td>
+<td>{{ r.checked_at }}</td>
+</tr>
+{% endfor %}
+</table>
+{% endfor %}
 </body>
 </html>
 """
 
 @app.route("/")
 def index():
-    items = list(STATUS.values())
-    items.sort(key=lambda x: (x["platform"], x["url"]))
-    return render_template_string(
-        TEMPLATE,
-        items=items,
-        last=LAST_FULL_CHECK or "în curs…",
-        interval=CHECK_INTERVAL_SECONDS
-    )
+    return render_template_string(HTML_TEMPLATE, status=STATUS, last_check=LAST_CHECK)
 
 @app.route("/api/status")
 def api_status():
     return jsonify({
-        "last_full_check": LAST_FULL_CHECK,
-        "interval_seconds": CHECK_INTERVAL_SECONDS,
-        "items": list(STATUS.values())
+        "last_check": LAST_CHECK,
+        "status": STATUS
     })
 
-# Render/Gunicorn folosește app:app
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port)
