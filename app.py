@@ -1,4 +1,4 @@
-import os
+ import os
 import re
 import html as html_lib
 import unicodedata
@@ -14,7 +14,7 @@ from flask import Flask, jsonify, request, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.1.1 beta"
+VERSION = "v0.1.2 beta"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
@@ -35,7 +35,6 @@ HEADERS = {
 # Date: restaurante (Bolt + Wolt)
 # ────────────────────────────────────────────────────────────────────────────────
 # Platformă, Locație, URL. Brandul se deduce din nume (Burgers / Smash / Tacos)
-
 RESTAURANTS = [
     # BOLT
     {"platform": "Bolt", "location": "Burgers Militari", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
@@ -62,7 +61,6 @@ RESTAURANTS = [
 # ────────────────────────────────────────────────────────────────────────────────
 # Utilități
 # ────────────────────────────────────────────────────────────────────────────────
-
 def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -230,8 +228,8 @@ app = Flask(__name__)
 
 @app.route("/")
 def index() -> Response:
-    # HTML simplu; datele vin din /api/status
-    html = f"""
+    # HTML simplu; datele vin din /api/status (fără f-string!)
+    html = """
 <!doctype html>
 <html lang="ro">
 <head>
@@ -239,45 +237,45 @@ def index() -> Response:
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>Status restaurante (Wolt / Bolt)</title>
   <style>
-    :root {{
+    :root {
       --bg:#0c0f10; --card:#141a1e; --muted:#a7b0b5; --txt:#eef3f5;
       --ok:#2ecc71; --bad:#e74c3c; --warn:#f1c40f; --chip:#1f2b33;
-    }}
-    html,body {{ background:var(--bg); color:var(--txt); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }}
-    .wrap {{ max-width:1100px; margin:48px auto; padding:0 16px; }}
-    h1 {{ font-size:28px; margin:0 0 6px; }}
-    .sub {{ color:var(--muted); font-size:14px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-    .btn {{ background:#1e8e5a; color:#fff; border:0; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:700; }}
-    .btn:disabled {{ opacity:.7; cursor:wait; }}
-    .grid {{ display:grid; gap:28px; margin-top:22px; }}
-    .card {{ background:var(--card); border-radius:16px; padding:0 0 8px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }}
-    .card h2 {{ margin:0; padding:16px 18px; font-size:20px; border-bottom:1px solid #22313a; }}
-    table {{ width:100%; border-collapse:collapse; }}
-    th, td {{ padding:12px 16px; border-bottom:1px solid #22313a; text-align:left; font-size:14px; vertical-align:top; }}
-    th {{ color:#bbd0da; font-weight:700; }}
-    .status {{ font-weight:700; }}
-    .ok {{ color:var(--ok); }}
-    .bad {{ color:var(--bad); }}
-    .warn {{ color:var(--warn); }}
-    .muted {{ color:var(--muted); }}
-    .chip {{ display:inline-block; background:var(--chip); color:#a7d6c2; padding:2px 8px; border-radius:999px; font-size:12px; margin-left:8px; }}
-    .footer {{ margin-top:18px; color:var(--muted); font-size:12px; }}
-    .version {{ margin-left:auto; background:#23313a; color:#9cc5b3; padding:2px 8px; border-radius:999px; font-size:12px; }}
-    .headerline {{ display:flex; gap:12px; align-items:center; }}
+    }
+    html,body { background:var(--bg); color:var(--txt); font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; }
+    .wrap { max-width:1100px; margin:48px auto; padding:0 16px; }
+    h1 { font-size:28px; margin:0 0 6px; }
+    .sub { color:var(--muted); font-size:14px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .btn { background:#1e8e5a; color:#fff; border:0; padding:10px 14px; border-radius:10px; cursor:pointer; font-weight:700; }
+    .btn:disabled { opacity:.7; cursor:wait; }
+    .grid { display:grid; gap:28px; margin-top:22px; }
+    .card { background:var(--card); border-radius:16px; padding:0 0 8px; box-shadow: 0 8px 24px rgba(0,0,0,.25); }
+    .card h2 { margin:0; padding:16px 18px; font-size:20px; border-bottom:1px solid #22313a; }
+    table { width:100%; border-collapse:collapse; }
+    th, td { padding:12px 16px; border-bottom:1px solid #22313a; text-align:left; font-size:14px; vertical-align:top; }
+    th { color:#bbd0da; font-weight:700; }
+    .status { font-weight:700; }
+    .ok { color:var(--ok); }
+    .bad { color:var(--bad); }
+    .warn { color:var(--warn); }
+    .muted { color:var(--muted); }
+    .chip { display:inline-block; background:var(--chip); color:#a7d6c2; padding:2px 8px; border-radius:999px; font-size:12px; margin-left:8px; }
+    .footer { margin-top:18px; color:var(--muted); font-size:12px; }
+    .version { margin-left:auto; background:#23313a; color:#9cc5b3; padding:2px 8px; border-radius:999px; font-size:12px; }
+    .headerline { display:flex; gap:12px; align-items:center; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <div class="headerline">
       <h1>📊 Status restaurante (Wolt / Bolt)</h1>
-      <span class="version">{VERSION}</span>
+      <span class="version">__VERSION__</span>
     </div>
     <div class="sub">
       <span>Ultima verificare completă: <b id="last-check">în curs…</b></span>
       <span>•</span>
       <span>Auto-refresh la <b>30s</b></span>
       <span>•</span>
-      <span>Interval verificare: <b>{CHECK_INTERVAL_SEC}s</b></span>
+      <span>Interval verificare: <b>__INTERVAL__s</b></span>
       <button id="refresh" class="btn" style="margin-left:12px">Reverifică acum</button>
     </div>
 
@@ -370,6 +368,7 @@ setInterval(load, 30000);
 </body>
 </html>
 """
+    html = html.replace("__VERSION__", VERSION).replace("__INTERVAL__", str(CHECK_INTERVAL_SEC))
     return Response(html, mimetype="text/html")
 
 
