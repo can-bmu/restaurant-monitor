@@ -1,4 +1,4 @@
- import os
+import os
 import re
 import html as html_lib
 import unicodedata
@@ -14,7 +14,7 @@ from flask import Flask, jsonify, request, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.1.2 beta"
+VERSION = "v0.1.5 beta"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
@@ -34,7 +34,7 @@ HEADERS = {
 # ────────────────────────────────────────────────────────────────────────────────
 # Date: restaurante (Bolt + Wolt)
 # ────────────────────────────────────────────────────────────────────────────────
-# Platformă, Locație, URL. Brandul se deduce din nume (Burgers / Smash / Tacos)
+
 RESTAURANTS = [
     # BOLT
     {"platform": "Bolt", "location": "Burgers Militari", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
@@ -61,6 +61,7 @@ RESTAURANTS = [
 # ────────────────────────────────────────────────────────────────────────────────
 # Utilități
 # ────────────────────────────────────────────────────────────────────────────────
+
 def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -119,15 +120,12 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
 
     # ── BOLT
     if "bolt.eu" in url:
-        # 1) JSON embeddat
         if re.search(r'"availabilitystatus"\s*:\s*"closed"', t):
             return "🔴 Închis", "Bolt JSON availabilityStatus=closed"
 
-        # 2) aria-label cu 'închis/temporar/closed'
         if re.search(r'aria-label="[^"]*(închis|temporar|closed)[^"]*"', html, flags=re.IGNORECASE):
             return "🔴 Închis", "Bolt aria-label: conține 'închis/temporar/closed'"
 
-        # 3) availabilityInfo fragment
         if avail_frag:
             if re.search(r"\binchis temporar\b", avail_frag) or (af_ascii and re.search(r"\binchis temporar\b", af_ascii)):
                 return "🔴 Închis", "Bolt availabilityInfo: „Închis temporar”"
@@ -138,7 +136,6 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
             if re.search(r"\btemporarily closed\b", avail_frag) or (af_ascii and re.search(r"\btemporarily closed\b", af_ascii)):
                 return "🔴 Închis", "Bolt availabilityInfo: „temporarily closed”"
 
-        # 4) fallback în tot documentul
         if re.search(r"\binchis temporar\b", t) or re.search(r"\binchis temporar\b", t_ascii):
             return "🔴 Închis", "Bolt UI: „Închis temporar”"
         if re.search(r"\binchis\b", t) or re.search(r"\binchis\b", t_ascii):
@@ -186,7 +183,6 @@ last_results: dict[str, dict] = {}   # key = url
 
 def check_all():
     global last_full_check_time, last_results
-    # sortăm lista pentru consistență
     items = sorted(RESTAURANTS, key=sort_key)
 
     out = {}
@@ -208,7 +204,6 @@ def check_all():
     last_full_check_time = now_str()
 
 def background_loop():
-    # rulăm o dată la start
     try:
         check_all()
     except Exception:
@@ -218,7 +213,6 @@ def background_loop():
         try:
             check_all()
         except Exception:
-            # nu blocăm bucla dacă pică ceva
             pass
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -226,11 +220,7 @@ def background_loop():
 # ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
-@app.route("/")
-def index() -> Response:
-    # HTML simplu; datele vin din /api/status (fără f-string!)
-    html = """
-<!doctype html>
+HTML_TEMPLATE = """<!doctype html>
 <html lang="ro">
 <head>
   <meta charset="utf-8">
@@ -368,13 +358,15 @@ setInterval(load, 30000);
 </body>
 </html>
 """
-    html = html.replace("__VERSION__", VERSION).replace("__INTERVAL__", str(CHECK_INTERVAL_SEC))
+
+@app.route("/")
+def index() -> Response:
+    html = HTML_TEMPLATE.replace("__VERSION__", VERSION).replace("__INTERVAL__", str(CHECK_INTERVAL_SEC))
     return Response(html, mimetype="text/html")
 
 
 @app.route("/api/status")
 def api_status():
-    # construim listă ordonată și o returnăm ca JSON
     items = []
     for it in sorted(RESTAURANTS, key=sort_key):
         r = last_results.get(it["url"])
@@ -401,7 +393,6 @@ def api_status():
 
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
-    # rulăm sincron o verificare completă
     check_all()
     return jsonify({"ok": True, "refreshed_at": now_str()})
 
@@ -416,5 +407,4 @@ def _start_background():
 _start_background()
 
 if __name__ == "__main__":
-    # Local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
