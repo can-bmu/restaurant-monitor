@@ -46,6 +46,7 @@ RESTAURANTS = [
     {"platform": "Bolt", "location": "Burgers Pipera", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/122872-gorilla's-crazy-burgers-pipera"},
     {"platform": "Bolt", "location": "Smash Pipera", "url": "https://food.bolt.eu/en-US/325-bucharest/p/157013-smash-gorilla/?utm_content=menu_header&utm_medium=product&utm_source=share_provider"},
     {"platform": "Bolt", "location": "Tacos Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/130672-gorilla's-crazy-tacos"},
+    {"platform": "Bolt", "location": "Test: Liquid Spirits", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/126569-liquid-spirits"},
     # WOLT
     {"platform": "Wolt", "location": "Burgers Militari", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-gorjului-67dc3f47b93a5300e8efd705"},
     {"platform": "Wolt", "location": "Smash Militari", "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-gorjului-6880a63946c4278a97069f59"},
@@ -56,6 +57,7 @@ RESTAURANTS = [
     {"platform": "Wolt", "location": "Burgers Pipera", "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-pipera-67e189430bd3fc375bb3acc9"},
     {"platform": "Wolt", "location": "Smash Pipera", "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced"},
     {"platform": "Wolt", "location": "Tacos Olteniței", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a"},
+    {"platform": "Wolt", "location": "Test: Shaormeria CA", "url": "https://wolt.com/ro/rou/bucharest/restaurant/shaormeria-ca-67dc3efb2e58c74a8f3511df"},
 ]
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -120,6 +122,10 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
 
     # ── BOLT
     if "bolt.eu" in url:
+        # verificare directă a textului "închis temporar" oriunde în HTML
+        if "închis temporar" in t or "inchis temporar" in t_ascii or "temporarily closed" in t_ascii:
+            return "🔴 Închis", "Bolt: text global conține „închis temporar”"
+
         if re.search(r'"availabilitystatus"\s*:\s*"closed"', t):
             return "🔴 Închis", "Bolt JSON availabilityStatus=closed"
 
@@ -135,15 +141,6 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
                 return "🔴 Închis", "Bolt availabilityInfo: „Deschide la HH:MM”"
             if re.search(r"\btemporarily closed\b", avail_frag) or (af_ascii and re.search(r"\btemporarily closed\b", af_ascii)):
                 return "🔴 Închis", "Bolt availabilityInfo: „temporarily closed”"
-
-        if re.search(r"\binchis temporar\b", t) or re.search(r"\binchis temporar\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Închis temporar”"
-        if re.search(r"\binchis\b", t) or re.search(r"\binchis\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Închis”"
-        if re.search(r"\btemporarily closed\b", t) or re.search(r"\btemporarily closed\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „temporarily closed”"
-        if re.search(r"deschide la \d{1,2}[:.]\d{2}", t) or re.search(r"deschide la \d{1,2}[:.]\d{2}", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Deschide la HH:MM”"
 
         if ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT:
             return "🔴 Închis", "Bolt: fallback ‘assume closed’ (nedetectabil)"
