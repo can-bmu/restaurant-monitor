@@ -2,6 +2,7 @@ import os
 import threading
 import time
 import re
+import unicodedata
 from datetime import datetime
 
 import requests
@@ -25,14 +26,14 @@ RESTAURANTS = {
     ],
     "Wolt": [
         {"name": "Burgers Militari",  "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-gorjului-67dc3f47b93a5300e8efd705"},
-        {"name": "Smash Militari",    "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-gorjului-6880a63946c4278a97069f59?srsltid=AfmBOorhoNaf1Q_3cirLld_oYSAo3uQ9JW13C2p6h8fgVASdkaVwbQwx"},
+        {"name": "Smash Militari",    "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-gorjului-6880a63946c4278a97069f59"},
         {"name": "Burgers Olteniței", "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-oltenitei-67e189430bd3fc375bb3acc8"},
-        {"name": "Smash Olteniței",   "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-berceni-6880a32754547abea1869cec?srsltid=AfmBOoqxe8amoCAhqB15o152PGNXULHnM_upiReSTCQyz_URAFREGZGh"},
-        {"name": "Smash Moșilor",     "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-mosilor-6880a63946c4278a97069f5a?srsltid=AfmBOor0fwOZtC1D6-22cz_hdap9fSgC3E4oqdqD7OonR2i6o5nl6jEi"},
-        {"name": "Burgers Moșilor",   "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-mosilor-67dc3f47b93a5300e8efd706?srsltid=AfmBOop0XnSmPfKUhYX81w9mNUfK1ZtUVJuyeqe4mNV7LDwJDT9oYzGW"},
+        {"name": "Smash Olteniței",   "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-berceni-6880a32754547abea1869cec"},
+        {"name": "Smash Moșilor",     "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-mosilor-6880a63946c4278a97069f5a"},
+        {"name": "Burgers Moșilor",   "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-mosilor-67dc3f47b93a5300e8efd706"},
         {"name": "Burgers Pipera",    "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-pipera-67e189430bd3fc375bb3acc9"},
-        {"name": "Smash Pipera",      "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced?srsltid=AfmBOooNCNAfypM0Ry_jGEj2R4bPId3Ac78LKm282Ae8NdaOPt9_qKOt"},
-        {"name": "Tacos Olteniței",   "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a?srsltid=AfmBOoqFDIClWfds-9WDwfnTe2y7RnwG6KYFsKexRwaZJlbHefkeHBzc"},
+        {"name": "Smash Pipera",      "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced"},
+        {"name": "Tacos Olteniței",   "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a"},
     ]
 }
 
@@ -45,40 +46,71 @@ HEADERS = {
 STATUS = {}
 LAST_CHECK = None
 
+# ------------------ SORTING (burgers -> smash -> tacos) ------------------
+def _norm(s: str) -> str:
+    # fără diacritice, lower
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii").lower()
+
+def _category_index(name: str) -> int:
+    n = _norm(name)
+    if "burger" in n:
+        return 0   # Gorilla's Crazy Burgers
+    if "smash" in n:
+        return 1   # Smash
+    if "taco" in n:
+        return 2   # Tacos
+    return 3       # orice altceva (la final)
+
+def _sorted_items(items):
+    return sorted(items, key=lambda it: (_category_index(it["name"]), _norm(it["name"])))
+
+
 # ------------------ DETECTION ------------------
 OPEN_PATTERNS = [
     r'"is_open"\s*:\s*true',
     r'"open"\s*:\s*true',
     r'"availabilityStatus"\s*:\s*"open"',
-    r'\bdeschis\b', r'\bopen\b',
+    r'\bdeschis\b', r'\bopen\b'
 ]
+
 CLOSED_PATTERNS = [
     r'"is_open"\s*:\s*false',
     r'"closed"\s*:\s*true',
     r'"open"\s*:\s*false',
     r'"availabilityStatus"\s*:\s*"closed"',
-    r'\bînchis\b', r'\binchis\b', r'\bclosed\b', r'temporarily\s*closed',
+    r'\bînchis\b', r'\binchis\b',
+    r'\bînchis\s+temporar\b', r'\binchis\s+temporar\b',
+    r'\btemporar\b',
+    r'\bdeschide\s+la\b',
+    r'\bopens\s+at\b', r'\bopening\s+at\b',
+    r'\bclosed\b', r'temporarily\s*closed'
 ]
 
 def classify_from_html(url: str, html: str) -> str:
-    """Heuristici combinate pentru a decide OPEN/CLOSED/NONE."""
+    """Heuristici combinate pentru a decide OPEN/CLOSED/NONE pe Bolt/Wolt."""
     t = html.lower()
 
-    # platform-specific quick hints
+    # ---- Bolt ----
     if "bolt.eu" in url:
-        # uneori apare in json "availabilityStatus"
         if re.search(r'"availabilitystatus"\s*:\s*"closed"', t):
             return "🔴 Închis"
         if re.search(r'"availabilitystatus"\s*:\s*"open"', t):
             return "🟢 Deschis"
+        if "închis temporar" in t or "inchis temporar" in t:
+            return "🔴 Închis"
+        if re.search(r'deschide\s+la\s+\d{1,2}[:.]\d{2}', t) or re.search(r'opens\s+at\s+\d{1,2}[:.]\d{2}', t):
+            return "🔴 Închis"
 
+    # ---- Wolt ----
     if "wolt.com" in url:
         if re.search(r'"is_open"\s*:\s*false', t):
             return "🔴 Închis"
         if re.search(r'"is_open"\s*:\s*true', t):
             return "🟢 Deschis"
+        if "închis" in t or "inchis" in t or "closed" in t:
+            return "🔴 Închis"
 
-    # generic patterns
+    # ---- fallback generic ----
     for pat in CLOSED_PATTERNS:
         if re.search(pat, t):
             return "🔴 Închis"
@@ -104,7 +136,7 @@ def check_once():
     new = {}
     for platform, items in RESTAURANTS.items():
         lst = []
-        for it in items:
+        for it in _sorted_items(items):   # <-- sortăm aici
             st = fetch_status(it["url"])
             lst.append({
                 "name": it["name"],
@@ -112,7 +144,7 @@ def check_once():
                 "status": st,
                 "checked_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             })
-            time.sleep(0.5)  # politicos cu site-urile
+            time.sleep(0.5)  # politicos
         new[platform] = lst
     STATUS = new
     LAST_CHECK = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -123,7 +155,7 @@ def background_loop():
         check_once()
         time.sleep(CHECK_INTERVAL)
 
-# rulează o verificare la import + loop periodic în background
+# rulează o verificare la import + loop periodic
 threading.Thread(target=check_once, daemon=True).start()
 threading.Thread(target=background_loop, daemon=True).start()
 
@@ -154,9 +186,7 @@ TEMPLATE = """
 <script>
 async function refreshNow(btn){
   btn.disabled = true; btn.innerText = 'Se verifică...';
-  try{
-    await fetch('/refresh', {method:'POST'});
-  }catch(e){}
+  try{ await fetch('/refresh', {method:'POST'}); }catch(e){}
   btn.innerText = 'Reverifică acum';
   btn.disabled = false;
   location.reload();
