@@ -314,32 +314,34 @@ def index() -> Response:
 const $ = (sel) => document.querySelector(sel);
 
 function badge(cls, text) {
-  return `<span class="status ${cls}">${text}</span>`;
+  return '<span class="status ' + cls + '">' + text + '</span>';
 }
 
 function rowHTML(it) {
-  const cls =
-    it.status.startsWith("🟢") ? "ok" :
-    it.status.startsWith("🔴") ? "bad" :
-    it.status.startsWith("❌") ? "bad" : "warn";
+  var cls = it.status.indexOf('🟢') === 0 ? 'ok'
+          : it.status.indexOf('🔴') === 0 ? 'bad'
+          : it.status.indexOf('❌') === 0 ? 'bad'
+          : 'warn';
 
-  return `<tr>
-    <td><a href="${it.url}" target="_blank" rel="noreferrer">${it.location}</a> <span class="chip">${it.brand}</span></td>
-    <td>${badge(cls, it.status)}</td>
-    <td class="muted">${it.reason}</td>
-    <td class="muted">${it.checked_at}</td>
-  </tr>`;
+  var html = '<tr>';
+  html += '<td><a href="' + it.url + '" target="_blank" rel="noreferrer">' +
+          it.location + '</a> <span class="chip">' + it.brand + '</span></td>';
+  html += '<td>' + badge(cls, it.status) + '</td>';
+  html += '<td class="muted">' + it.reason + '</td>';
+  html += '<td class="muted">' + it.checked_at + '</td>';
+  html += '</tr>';
+  return html;
 }
 
 function fillTables(data) {
   $("#last-check").textContent = data.last_full_check || "—";
   const boltRows = [];
   const woltRows = [];
-  (data.items || []).forEach(it => {
+  (data.items || []).forEach(function(it){
     (it.platform === "Bolt" ? boltRows : woltRows).push(rowHTML(it));
   });
-  $("#bolt tbody").innerHTML = boltRows.join("") || `<tr><td colspan="4" class="muted">—</td></tr>`;
-  $("#wolt tbody").innerHTML = woltRows.join("") || `<tr><td colspan="4" class="muted">—</td></tr>`;
+  $("#bolt tbody").innerHTML = boltRows.join("") || '<tr><td colspan="4" class="muted">—</td></tr>';
+  $("#wolt tbody").innerHTML = woltRows.join("") || '<tr><td colspan="4" class="muted">—</td></tr>';
 }
 
 async function load() {
@@ -352,13 +354,11 @@ async function load() {
   }
 }
 
-$("#refresh").addEventListener("click", async () => {
+$("#refresh").addEventListener("click", async function() {
   const btn = $("#refresh");
   btn.disabled = true;
   btn.textContent = "Se verifică…";
-  try {
-    await fetch("/api/refresh", {method:"POST"});
-  } catch(e) {}
+  try { await fetch("/api/refresh", {method:"POST"}); } catch(e) {}
   await load();
   btn.disabled = false;
   btn.textContent = "Reverifică acum";
