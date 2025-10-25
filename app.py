@@ -16,14 +16,13 @@ from flask import Flask, jsonify, request, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.2.2 beta"
+VERSION = "v0.2.3"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 REQ_TIMEOUT = int(os.getenv("REQ_TIMEOUT", "10"))
 
-# Wolt are nevoie de lat/lon pentru a calcula „open” pe zona curentă
 WOLT_LAT = float(os.getenv("WOLT_LAT", "44.4268"))   # București
 WOLT_LON = float(os.getenv("WOLT_LON", "26.1025"))
 
@@ -55,9 +54,6 @@ RESTAURANTS = [
     {"platform": "Bolt", "location": "Smash Pipera", "url": "https://food.bolt.eu/en-US/325-bucharest/p/157013-smash-gorilla/?utm_content=menu_header&utm_medium=product&utm_source=share_provider"},
     {"platform": "Bolt", "location": "Tacos Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/130672-gorilla's-crazy-tacos"},
 
-    # BOLT – TEST
-    {"platform": "Bolt", "location": "Test: Liquid Spirits", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/126569-liquid-spirits"},
-
     # WOLT
     {"platform": "Wolt", "location": "Burgers Militari", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-gorjului-67dc3f47b93a5300e8efd705"},
     {"platform": "Wolt", "location": "Smash Militari", "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-gorjului-6880a63946c4278a97069f59"},
@@ -68,9 +64,6 @@ RESTAURANTS = [
     {"platform": "Wolt", "location": "Burgers Pipera", "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-pipera-67e189430bd3fc375bb3acc9"},
     {"platform": "Wolt", "location": "Smash Pipera", "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced"},
     {"platform": "Wolt", "location": "Tacos Olteniței", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a"},
-
-    # WOLT – TEST
-    {"platform": "Wolt", "location": "Test: Shaormeria CA", "url": "https://wolt.com/ro/rou/bucharest/restaurant/shaormeria-ca-67dc3efb2e58c74a8f3511df"},
 ]
 
 # ────────────────────────────────────────────────────────────────────────────────
@@ -168,77 +161,9 @@ def bolt_check_via_api(url: str):
         return None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Wolt API
-# ────────────────────────────────────────────────────────────────────────────────
-def wolt_slug_from_url(url: str):
-    p = urlparse(url)
-    segs = [s for s in p.path.split("/") if s]
-    if "restaurant" in segs:
-        i = segs.index("restaurant")
-        if i + 1 < len(segs):
-            return segs[i + 1]
-    return segs[-1] if segs else None
-
-def wolt_check_via_api(url: str):
-    slug = wolt_slug_from_url(url)
-    if not slug:
-        return None
-    api = f"https://restaurant-api.wolt.com/v1/pages/venue/{slug}"
-    params = {"lat": f"{WOLT_LAT:.6f}", "lon": f"{WOLT_LON:.6f}"}
-    try:
-        r = requests.get(api, headers=HEADERS, params=params, timeout=REQ_TIMEOUT)
-        if r.status_code >= 400:
-            return None
-        data = r.json()
-
-        def g(keys, default=None):
-            cur = data
-            for k in keys:
-                if isinstance(cur, dict) and k in cur:
-                    cur = cur[k]
-                else:
-                    return default
-            return cur
-
-        candidates = [
-            ("is_open", g(["venue", "is_open"])),
-            ("online", g(["venue", "online"])),
-            ("is_open", g(["page", "data", "venue", "is_open"])),
-            ("online", g(["page", "data", "venue", "online"])),
-            ("delivery_open_status", g(["venue", "delivery_open_status"])),
-            ("delivery_open_status", g(["page", "data", "venue", "delivery_open_status"])),
-        ]
-        for key, val in candidates:
-            if val is None:
-                continue
-            if isinstance(val, bool):
-                return ("🟢 Deschis", f"Wolt API: {key}=true") if val else ("🔴 Închis", f"Wolt API: {key}=false")
-            if isinstance(val, str):
-                v = val.upper()
-                if v in ("OPEN", "ONLINE", "OPEN_FOR_DELIVERIES"):
-                    return "🟢 Deschis", f"Wolt API: {key}={val}"
-                if v in ("CLOSED", "OFFLINE", "CLOSED_FOR_DELIVERIES"):
-                    return "🔴 Închis", f"Wolt API: {key}={val}"
-
-        next_open  = g(["venue", "next_open"])  or g(["page", "data", "venue", "next_open"])
-        next_close = g(["venue", "next_close"]) or g(["page", "data", "venue", "next_close"])
-        is_online  = g(["venue", "online"])
-        if is_online is True and next_close:
-            return "🟢 Deschis", "Wolt API: online (are next_close)"
-        if is_online is False and next_open:
-            return "🔴 Închis", "Wolt API: offline (are next_open)"
-
-        return None
-    except Exception:
-        return None
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Fallback HTML (inclusiv pattern-urile Wolt din snippetul tău)
+# HTML Classifier (inclusiv pentru Wolt)
 # ────────────────────────────────────────────────────────────────────────────────
 def classify_html(url: str, html: str):
-    """
-    Returnează (status, motiv) doar pe baza HTML-ului.
-    """
     t, t_ascii = _normalize_html_text(html)
     avail_frag = _extract_availability_info_block(html)
     af_ascii = (
@@ -256,47 +181,24 @@ def classify_html(url: str, html: str):
                 return "🔴 Închis", "Bolt availabilityInfo: „Închis temporar”"
             if re.search(r"\binchis\b", avail_frag) or (af_ascii and re.search(r"\binchis\b", af_ascii)):
                 return "🔴 Închis", "Bolt availabilityInfo: „Închis”"
-            if re.search(r"deschide la \d{1,2}[:.]\d{2}", avail_frag) or (af_ascii and re.search(r"deschide la \d{1,2}[:.]\d{2}", af_ascii)):
+            if re.search(r"deschide la \d{1,2}[:.]\d{2}", avail_frag):
                 return "🔴 Închis", "Bolt availabilityInfo: „Deschide la HH:MM”"
-            if re.search(r"\btemporarily closed\b", avail_frag) or (af_ascii and re.search(r"\btemporarily closed\b", af_ascii)):
-                return "🔴 Închis", "Bolt availabilityInfo: „temporarily closed”"
-
-        if re.search(r"\binchis temporar\b", t) or re.search(r"\binchis temporar\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Închis temporar”"
-        if re.search(r"\binchis\b", t) or re.search(r"\binchis\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Închis”"
-        if re.search(r"\btemporarily closed\b", t) or re.search(r"\btemporarily closed\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „temporarily closed”"
-        if re.search(r"deschide la \d{1,2}[:.]\d{2}", t) or re.search(r"deschide la \d{1,2}[:.]\d{2}", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Deschide la HH:MM”"
 
         if ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT:
-            return "🔴 Închis", "Bolt: fallback ‘assume closed’ (nedetectabil)"
-        return "🟡 Nedetectabil", "Bolt: niciun semnal clar (nici closed, nici opens-at)"
+            return "🔴 Închis", "Bolt: fallback ‘assume closed’"
+        return "🟡 Nedetectabil", "Bolt: niciun semnal clar"
 
     if "wolt.com" in url:
-        # 1) Butonul „Programează o comandă” din VenueToolbar -> închis
         if re.search(r'data-test-id="VenueToolbar\.DeliveryUnavailableStatusButton"', html):
-            return "🔴 Închis", "Wolt UI: ‘Programează o comandă’ (DeliveryUnavailableStatusButton)"
-
-        # 2) Badge-uri & fraze explicite
-        if re.search(r"\binchis\b", t) or re.search(r"\binchis\b", t_ascii):
-            return "🔴 Închis", "Wolt UI: ‘Închis’"
-        if re.search(r"\bse deschide la\b", t) or re.search(r"\bse deschide la\b", t_ascii):
-            return "🔴 Închis", "Wolt UI: ‘Se deschide la …’"
-
-        # 3) ‘Deschis până la …’ => deschis
-        if re.search(r"deschis p(?:â|a)na la \d{1,2}[:.]\d{2}", t) or re.search(r"deschis pana la \d{1,2}[:.]\d{2}", t_ascii):
+            return "🔴 Închis", "Wolt UI: ‘DeliveryUnavailableStatusButton’"
+        if "închis" in t or "se deschide la" in t:
+            return "🔴 Închis", "Wolt UI: ‘Închis / Se deschide la …’"
+        if re.search(r"deschis p(?:â|a)na la \d{1,2}[:.]\d{2}", t) or re.search(r"open until", t_ascii):
             return "🟢 Deschis", "Wolt UI: ‘Deschis până la …’"
-        if re.search(r"\bopen until\b", t_ascii):
-            return "🟢 Deschis", "Wolt UI: ‘Open until …’"
+        if "deschis" in t or "open now" in t_ascii:
+            return "🟢 Deschis", "Wolt UI: ‘Deschis / Open now’"
+        return "🟡 Nedetectabil", "Wolt UI: fără semnal clar"
 
-        # 4) fallback moale
-        if re.search(r"\bdeschis\b", t) or re.search(r"\bopen now\b", t_ascii):
-            return "🟢 Deschis", "Wolt UI: ‘deschis/open now’"
-        return "🟡 Nedetectabil", "Wolt: semnal UI/JSON absent"
-
-    # fallback generic
     if re.search(r"\bclosed\b", t) or re.search(r"\binchis\b", t):
         return "🔴 Închis", "Text generic: ‘closed/închis’"
     if re.search(r"\bopen now\b", t) or re.search(r"\bdeschis acum\b", t):
@@ -307,20 +209,15 @@ def classify_html(url: str, html: str):
 # Motor de verificare
 # ────────────────────────────────────────────────────────────────────────────────
 last_full_check_time = None
-last_results = {}   # key = url
+last_results = {}
 
 def fetch_status_and_reason(url: str):
-    # 1) API direct
     if "bolt.eu" in url:
         r = bolt_check_via_api(url)
         if r:
             return r
-    if "wolt.com" in url:
-        r = wolt_check_via_api(url)
-        if r:
-            return r
 
-    # 2) fallback pe HTML
+    # Wolt → doar HTML
     try:
         resp = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
         if resp.status_code >= 400:
@@ -362,6 +259,7 @@ def background_loop():
             check_all()
         except Exception:
             pass
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Web
