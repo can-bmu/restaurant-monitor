@@ -17,7 +17,7 @@ from flask import Flask, jsonify, request, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.2.0 beta"
+VERSION = "v0.2.1 beta"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
@@ -71,14 +71,13 @@ RESTAURANTS = [
     {"platform": "Wolt", "location": "Smash Pipera", "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced"},
     {"platform": "Wolt", "location": "Tacos Olteniței", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a"},
 
-    # WOLT – TEST (ar trebui să fie deschis dacă e livrabil în zonă)
+    # WOLT – TEST
     {"platform": "Wolt", "location": "Test: Shaormeria CA", "url": "https://wolt.com/ro/rou/bucharest/restaurant/shaormeria-ca-67dc3efb2e58c74a8f3511df"},
 ]
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Utilități
 # ────────────────────────────────────────────────────────────────────────────────
-
 def now_str():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -89,6 +88,9 @@ def brand_of(location: str) -> str:
     if "smash" in l:
         return "Smash"
     return "Burgers"
+
+def is_test_location(location: str) -> bool:
+    return location.strip().lower().startswith("test:")
 
 BRAND_ORDER = {"Burgers": 1, "Smash": 2, "Tacos": 3}
 LOC_ORDER = {"militari": 1, "olteni": 2, "olteniț": 2, "mosilor": 3, "moșilor": 3, "pipera": 4}
@@ -126,9 +128,7 @@ def _extract_availability_info_block(t: str):
 # ────────────────────────────────────────────────────────────────────────────────
 # Bolt API
 # ────────────────────────────────────────────────────────────────────────────────
-
 def bolt_provider_id_from_url(url: str):
-    # caută /p/12345-... sau /p/12345
     m = re.search(r"/p/(\d+)", url)
     return m.group(1) if m else None
 
@@ -136,8 +136,6 @@ def bolt_check_via_api(url: str):
     pid = bolt_provider_id_from_url(url)
     if not pid:
         return None
-
-    # parametrii necesari (observați când ați sniffuit în Network)
     api = "https://deliveryuser.live.boltsvc.net/deliveryClient/public/getProviderAvailabilityStatus"
     params = {
         "provider_id": pid,
@@ -146,7 +144,6 @@ def bolt_check_via_api(url: str):
         "device_name": "web",
         "device_os_version": "web",
         "deviceType": "web",
-        # deviceId poate fi orice UUID valid – îl facem determinist pe provider
         "deviceId": str(uuid.uuid5(uuid.NAMESPACE_URL, f"bolt:{pid}")),
     }
     try:
@@ -163,12 +160,10 @@ def bolt_check_via_api(url: str):
         )
         if flags:
             return "🟢 Deschis", "Bolt API: disponibil (delivery/takeaway/schedule)"
-        # motiv în textul overlay/snackbar (ex: „Deschide la 14:00”)
         ov = (data.get("provider_overlay_text") or {}).get("value")
         sb = (data.get("provider_snackbar_text") or {}).get("value")
         if ov or sb:
-            txt = ov or sb
-            txt = str(txt)
+            txt = (ov or sb) or ""
             if "deschide la" in txt.lower():
                 return "🔴 Închis", f'Bolt API: „{txt}”'
         return "🔴 Închis", "Bolt API: indisponibil"
@@ -178,16 +173,13 @@ def bolt_check_via_api(url: str):
 # ────────────────────────────────────────────────────────────────────────────────
 # Wolt API
 # ────────────────────────────────────────────────────────────────────────────────
-
 def wolt_slug_from_url(url: str):
     p = urlparse(url)
     segs = [s for s in p.path.split("/") if s]
-    # URL-urile sunt de forma .../restaurant/<slug>
     if "restaurant" in segs:
         i = segs.index("restaurant")
         if i + 1 < len(segs):
             return segs[i + 1]
-    # fallback: ultimul segment
     return segs[-1] if segs else None
 
 def wolt_check_via_api(url: str):
@@ -211,7 +203,6 @@ def wolt_check_via_api(url: str):
                     return default
             return cur
 
-        # chei uzuale
         candidates = [
             ("is_open", g(["venue", "is_open"])),
             ("online", g(["venue", "online"])),
@@ -232,7 +223,6 @@ def wolt_check_via_api(url: str):
                 if v in ("CLOSED", "OFFLINE", "CLOSED_FOR_DELIVERIES"):
                     return "🔴 Închis", f"Wolt API: {key}={val}"
 
-        # orar următor
         next_open  = g(["venue", "next_open"])  or g(["page", "data", "venue", "next_open"])
         next_close = g(["venue", "next_close"]) or g(["page", "data", "venue", "next_close"])
         is_online  = g(["venue", "online"])
@@ -246,13 +236,9 @@ def wolt_check_via_api(url: str):
         return None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Fallback HTML (Bolt + Wolt) – când API-urile nu dau semnal
+# Fallback HTML
 # ────────────────────────────────────────────────────────────────────────────────
-
 def classify_html(url: str, html: str):
-    """
-    Returnează (status, motiv) doar pe baza HTML-ului.
-    """
     t, t_ascii = _normalize_html_text(html)
     avail_frag = _extract_availability_info_block(html)
     af_ascii = (
@@ -308,7 +294,7 @@ last_full_check_time = None
 last_results = {}   # key = url
 
 def fetch_status_and_reason(url: str):
-    # 1) API-uri directe (fără a descărca pagina)
+    # 1) API-uri directe
     if "bolt.eu" in url:
         r = bolt_check_via_api(url)
         if r:
@@ -318,7 +304,7 @@ def fetch_status_and_reason(url: str):
         if r:
             return r
 
-    # 2) fallback pe HTML pagină
+    # 2) fallback pe HTML
     try:
         resp = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
         if resp.status_code >= 400:
@@ -340,6 +326,7 @@ def check_all():
                 "platform": it["platform"],
                 "location": it["location"],
                 "brand": brand_of(it["location"]),
+                "is_test": is_test_location(it["location"]),
                 "url": it["url"],
                 "status": status,
                 "reason": reason,
@@ -459,6 +446,7 @@ HTML = """<!doctype html>
 <script>
 const $ = (sel) => document.querySelector(sel);
 let detailed = false;
+let lastData = null;
 
 function badge(cls, text) {
   return '<span class="status ' + cls + '">' + text + '</span>';
@@ -486,13 +474,18 @@ function applyDetailMode() {
   });
 }
 
-function fillTables(data) {
+function render(data) {
   $("#last-check").textContent = data.last_full_check || "—";
+
+  // ascunde rândurile de test în modul simplu
+  const filtered = (data.items || []).filter(it => detailed || !it.is_test);
+
   const boltRows = [];
   const woltRows = [];
-  (data.items || []).forEach(function(it){
+  filtered.forEach(function(it){
     (it.platform === "Bolt" ? boltRows : woltRows).push(rowHTML(it));
   });
+
   $("#bolt tbody").innerHTML = boltRows.join("") || '<tr><td colspan="4" class="muted">—</td></tr>';
   $("#wolt tbody").innerHTML = woltRows.join("") || '<tr><td colspan="4" class="muted">—</td></tr>';
   applyDetailMode();
@@ -501,8 +494,8 @@ function fillTables(data) {
 async function load() {
   try {
     const r = await fetch("/api/status");
-    const j = await r.json();
-    fillTables(j);
+    lastData = await r.json();
+    render(lastData);
   } catch(e) {
     console.error(e);
   }
@@ -520,7 +513,7 @@ $("#refresh").addEventListener("click", async function() {
 
 $("#toggle").addEventListener("click", function(){
   detailed = !detailed;
-  applyDetailMode();
+  if (lastData) render(lastData);
 });
 
 load();
@@ -539,19 +532,27 @@ def index():
 def api_status():
     items = []
     for it in sorted(RESTAURANTS, key=sort_key):
+        base = {
+            "platform": it["platform"],
+            "location": it["location"],
+            "brand": brand_of(it["location"]),
+            "is_test": is_test_location(it["location"]),
+            "url": it["url"],
+        }
         r = last_results.get(it["url"])
         if r is None:
             items.append({
-                "platform": it["platform"],
-                "location": it["location"],
-                "brand": brand_of(it["location"]),
-                "url": it["url"],
+                **base,
                 "status": "🟡 Nedetectabil",
                 "reason": "Încă nu s-a verificat",
                 "checked_at": "—",
             })
         else:
-            items.append(r)
+            # asigură că includem is_test și brand chiar dacă vin din cache
+            out = {**r}
+            out["is_test"] = base["is_test"]
+            out["brand"] = base["brand"]
+            items.append(out)
 
     return jsonify({
         "version": VERSION,
@@ -589,5 +590,4 @@ def _start_background():
 _start_background()
 
 if __name__ == "__main__":
-    # Local dev
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
