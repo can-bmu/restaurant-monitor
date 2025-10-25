@@ -6,8 +6,8 @@ import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from uuid import uuid4
 
 import requests
 from flask import Flask, jsonify, Response
@@ -15,7 +15,7 @@ from flask import Flask, jsonify, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.1.6 beta"
+VERSION = "v0.1.7 beta"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
@@ -32,47 +32,44 @@ HEADERS = {
     "Accept-Language": "ro-RO,ro;q=0.9,en;q=0.8",
 }
 
-BOLT_API_URL = (
-    "https://deliveryuser.live.boltsvc.net/"
-    "deliveryClient/public/getProviderAvailabilityStatus"
-)
-
 # ────────────────────────────────────────────────────────────────────────────────
 # Date: restaurante (Bolt + Wolt)
 # ────────────────────────────────────────────────────────────────────────────────
-RESTAURANTS = [
-    # BOLT (Gorilla)
-    {"platform": "Bolt", "location": "Burgers Militari", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
-    {"platform": "Bolt", "location": "Smash Militari", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/157022-smash-gorilla/info"},
-    {"platform": "Bolt", "location": "Burgers Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/81061-gorilla's-crazy-burgers-berceni"},
-    {"platform": "Bolt", "location": "Smash Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/156512"},
-    {"platform": "Bolt", "location": "Smash Moșilor", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/157033-smash-gorilla"},
-    {"platform": "Bolt", "location": "Burgers Moșilor", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/69192-gorilla's-crazy-burgers-mosilor"},
-    {"platform": "Bolt", "location": "Burgers Pipera", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/122872-gorilla's-crazy-burgers-pipera"},
-    {"platform": "Bolt", "location": "Smash Pipera", "url": "https://food.bolt.eu/en-US/325-bucharest/p/157013-smash-gorilla/?utm_content=menu_header&utm_medium=product&utm_source=share_provider"},
-    {"platform": "Bolt", "location": "Tacos Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/130672-gorilla's-crazy-tacos"},
 
-    # BOLT (test deschis/închis cu API)
+RESTAURANTS = [
+    # BOLT (Gorilla’s)
+    {"platform": "Bolt", "location": "Burgers Militari",  "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
+    {"platform": "Bolt", "location": "Smash Militari",    "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/157022-smash-gorilla/info"},
+    {"platform": "Bolt", "location": "Burgers Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/81061-gorilla's-crazy-burgers-berceni"},
+    {"platform": "Bolt", "location": "Smash Olteniței",   "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/156512"},
+    {"platform": "Bolt", "location": "Smash Moșilor",     "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/157033-smash-gorilla"},
+    {"platform": "Bolt", "location": "Burgers Moșilor",   "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/69192-gorilla's-crazy-burgers-mosilor"},
+    {"platform": "Bolt", "location": "Burgers Pipera",    "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/122872-gorilla's-crazy-burgers-pipera"},
+    {"platform": "Bolt", "location": "Smash Pipera",      "url": "https://food.bolt.eu/en-US/325-bucharest/p/157013-smash-gorilla/?utm_content=menu_header&utm_medium=product&utm_source=share_provider"},
+    {"platform": "Bolt", "location": "Tacos Olteniței",   "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/130672-gorilla's-crazy-tacos"},
+
+    # BOLT – TEST (deschis)
     {"platform": "Bolt", "location": "Test: Liquid Spirits", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/126569-liquid-spirits"},
 
-    # WOLT (Gorilla)
-    {"platform": "Wolt", "location": "Burgers Militari", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-gorjului-67dc3f47b93a5300e8efd705"},
-    {"platform": "Wolt", "location": "Smash Militari", "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-gorjului-6880a63946c4278a97069f59"},
+    # WOLT (Gorilla’s)
+    {"platform": "Wolt", "location": "Burgers Militari",  "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-gorjului-67dc3f47b93a5300e8efd705"},
+    {"platform": "Wolt", "location": "Smash Militari",    "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-gorjului-6880a63946c4278a97069f59"},
     {"platform": "Wolt", "location": "Burgers Olteniței", "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-oltenitei-67e189430bd3fc375bb3acc8"},
-    {"platform": "Wolt", "location": "Smash Olteniței", "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-berceni-6880a32754547abea1869cec"},
-    {"platform": "Wolt", "location": "Smash Moșilor", "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-mosilor-6880a63946c4278a97069f5a"},
-    {"platform": "Wolt", "location": "Burgers Moșilor", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-mosilor-67dc3f47b93a5300e8efd706"},
-    {"platform": "Wolt", "location": "Burgers Pipera", "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-pipera-67e189430bd3fc375bb3acc9"},
-    {"platform": "Wolt", "location": "Smash Pipera", "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced"},
-    {"platform": "Wolt", "location": "Tacos Olteniței", "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a"},
+    {"platform": "Wolt", "location": "Smash Olteniței",   "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-berceni-6880a32754547abea1869cec"},
+    {"platform": "Wolt", "location": "Smash Moșilor",     "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-mosilor-6880a63946c4278a97069f5a"},
+    {"platform": "Wolt", "location": "Burgers Moșilor",   "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-mosilor-67dc3f47b93a5300e8efd706"},
+    {"platform": "Wolt", "location": "Burgers Pipera",    "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-pipera-67e189430bd3fc375bb3acc9"},
+    {"platform": "Wolt", "location": "Smash Pipera",      "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced"},
+    {"platform": "Wolt", "location": "Tacos Olteniței",   "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a"},
 
-    # WOLT (test deschis/închis)
+    # WOLT – TEST (deschis)
     {"platform": "Wolt", "location": "Test: Shaormeria CA", "url": "https://wolt.com/ro/rou/bucharest/restaurant/shaormeria-ca-67dc3efb2e58c74a8f3511df"},
 ]
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Utilități
 # ────────────────────────────────────────────────────────────────────────────────
+
 def now_str() -> str:
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
 
@@ -95,7 +92,6 @@ def sort_key(item: dict):
         if k in loc:
             loc_score = v
             break
-    # Bolt înainte, apoi Wolt; apoi brand; apoi locația
     return (item["platform"] != "Bolt", b, loc_score, item["location"])
 
 def _normalize_html_text(s: str) -> tuple[str, str]:
@@ -117,94 +113,62 @@ def _extract_availability_info_block(t: str) -> str | None:
     frag = re.sub(r"\s+", " ", frag)
     return frag
 
-# ────────────────────────────────────────────────────────────────────────────────
-# Bolt API helper
-# ────────────────────────────────────────────────────────────────────────────────
-PROVIDER_ID_RE = re.compile(r"/p/(\d+)")
-
-def bolt_provider_id_from_url(url: str) -> str | None:
-    m = PROVIDER_ID_RE.search(url)
+def extract_bolt_provider_id(url: str) -> str | None:
+    m = re.search(r"/p/(\d+)", url)
     return m.group(1) if m else None
 
-def bolt_api_probe(url: str, timeout: float = 8.0) -> tuple[str, str] | None:
+def probe_bolt_api(provider_id: str) -> tuple[str | None, str | None]:
     """
-    Întoarce (status, motiv) folosind API-ul public Bolt.
-    Dacă nu putem determina (eroare / lipsă id), returnează None pentru fallback pe HTML.
+    Întoarce (status, motiv) sau (None, None) dacă nu reușește.
     """
-    provider_id = bolt_provider_id_from_url(url)
-    if not provider_id:
-        return None
-
-    # Referer = pagina restaurantului (ajută uneori)
-    referer = f"{urlparse(url).scheme}://{urlparse(url).netloc}{urlparse(url).path}"
-    params = {
-        "provider_id": provider_id,
-        "version": "FW.1.98",
-        "language": "ro-RO",
-        "session_id": f"mon-{provider_id}",
-        "distinct_id": f"$device:mon-{provider_id}",
-        "country": "ro",
-        "device_name": "web",
-        "device_os_version": "web",
-        "deviceId": f"mon-{provider_id}",
-        "deviceType": "web",
-    }
     try:
+        params = {
+            "provider_id": provider_id,
+            "version": "FW.1.98",
+            "language": "ro-RO",
+            "country": "ro",
+            "device_name": "web",
+            "device_os_version": "web",
+            "deviceId": str(uuid4()),
+            "deviceType": "web",
+        }
         r = requests.get(
-            BOLT_API_URL,
+            "https://deliveryuser.live.boltsvc.net/deliveryClient/public/getProviderAvailabilityStatus",
             params=params,
-            headers={**HEADERS, "Referer": referer},
-            timeout=timeout,
+            headers=HEADERS,
+            timeout=12,
         )
         j = r.json()
+        data = j.get("data") or {}
+        # considerăm deschis dacă oricare dintre flagurile "is_available_*" e True
+        flags = [
+            data.get("is_available_for_delivery"),
+            data.get("is_available_for_takeaway"),
+            data.get("is_available_for_schedule_delivery"),
+            data.get("is_available_for_schedule_takeaway"),
+        ]
+        overlay = (data.get("provider_overlay_text") or {}).get("value")
+        snack = (data.get("provider_snackbar_text") or {}).get("value")
+
+        if any(f is True for f in flags):
+            reason = "Bolt API: disponibil (delivery/takeaway/schedule)"
+            if overlay:
+                reason += f" — {overlay}"
+            return "🟢 Deschis", reason
+
+        if all(f is False for f in flags):
+            msg = overlay or snack or "indisponibil"
+            return "🔴 Închis", f"Bolt API: {msg}"
+
+        # altfel nedeterminabil
+        return "🟡 Nedetectabil", "Bolt API: răspuns neconcludent"
     except Exception:
-        return None
+        return None, None
 
-    if not isinstance(j, dict) or "data" not in j:
-        return None
-
-    d = j.get("data") or {}
-    # Booleenele de disponibilitate
-    avail_keys = [
-        "is_available_for_delivery",
-        "is_available_for_takeaway",
-        "is_available_for_schedule_delivery",
-        "is_available_for_schedule_takeaway",
-    ]
-    any_true = any(bool(d.get(k)) for k in avail_keys)
-
-    # Texte explicative (overlay/snackbar)
-    overlay = d.get("provider_overlay_text") or {}
-    snack = d.get("provider_snackbar_text") or {}
-    overlay_val = overlay.get("value") if isinstance(overlay, dict) else overlay
-    snack_val = snack.get("value") if isinstance(snack, dict) else snack
-
-    if any_true:
-        # Deschis pe cel puțin un canal
-        reason_bits = []
-        if d.get("is_available_for_delivery"):
-            reason_bits.append("delivery")
-        if d.get("is_available_for_takeaway"):
-            reason_bits.append("takeaway")
-        if d.get("is_available_for_schedule_delivery"):
-            reason_bits.append("schedule_delivery")
-        if d.get("is_available_for_schedule_takeaway"):
-            reason_bits.append("schedule_takeaway")
-        return "🟢 Deschis", f"Bolt API: disponibil ({', '.join(reason_bits)})"
-
-    # Toate false → Închis; încearcă să folosești mesajul lor (ex. „Deschide la 14:00”)
-    msg = overlay_val or snack_val
-    if isinstance(msg, str) and msg.strip():
-        return "🔴 Închis", f"Bolt API: {msg.strip()}"
-
-    return "🔴 Închis", "Bolt API: indisponibil (toate canalele false)"
-
-# ────────────────────────────────────────────────────────────────────────────────
-# Clasificare HTML (fallback)
-# ────────────────────────────────────────────────────────────────────────────────
 def classify_with_reason(url: str, html: str) -> tuple[str, str]:
     """
-    Returnează (status, motiv) pe baza HTML (fallback).
+    Returnează (status, motiv).
+    Status: '🔴 Închis', '🟢 Deschis', '🟡 Nedetectabil', '❌ Eroare'
     """
     t, t_ascii = _normalize_html_text(html)
     avail_frag = _extract_availability_info_block(html)
@@ -214,7 +178,7 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
         else None
     )
 
-    # ── BOLT (fallback doar dacă API-ul nu a furnizat răspuns)
+    # ── BOLT (fallback pe HTML/UI dacă nu avem API sau API nu dă concluzie)
     if "bolt.eu" in url:
         if re.search(r'"availabilitystatus"\s*:\s*"closed"', t):
             return "🔴 Închis", "Bolt JSON availabilityStatus=closed"
@@ -232,19 +196,36 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
             if re.search(r"\btemporarily closed\b", avail_frag) or (af_ascii and re.search(r"\btemporarily closed\b", af_ascii)):
                 return "🔴 Închis", "Bolt availabilityInfo: „temporarily closed”"
 
+        if re.search(r"\binchis temporar\b", t) or re.search(r"\binchis temporar\b", t_ascii):
+            return "🔴 Închis", "Bolt UI: „Închis temporar”"
+        if re.search(r"\binchis\b", t) or re.search(r"\binchis\b", t_ascii):
+            return "🔴 Închis", "Bolt UI: „Închis”"
+        if re.search(r"\btemporarily closed\b", t) or re.search(r"\btemporarily closed\b", t_ascii):
+            return "🔴 Închis", "Bolt UI: „temporarily closed”"
+        if re.search(r"deschide la \d{1,2}[:.]\d{2}", t) or re.search(r"deschide la \d{1,2}[:.]\d{2}", t_ascii):
+            return "🔴 Închis", "Bolt UI: „Deschide la HH:MM”"
+
         if ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT:
             return "🔴 Închis", "Bolt: fallback ‘assume closed’ (nedetectabil)"
         return "🟡 Nedetectabil", "Bolt: niciun semnal clar (nici closed, nici opens-at)"
 
-    # ── WOLT
+    # ── WOLT (detectare din UI, stabil pe HTML server-side)
     if "wolt.com" in url:
-        if re.search(r'"is_open"\s*:\s*false', t):
-            return "🔴 Închis", "Wolt JSON is_open=false"
+        # Închis (badge “Închis” lângă rating / bară aflată sub header)
+        if re.search(r"\bînchis\b", t, flags=re.IGNORECASE):
+            return "🔴 Închis", "Wolt UI: Închis"
+        # Deschis (apare “Deschis până la HH:MM”)
+        if re.search(r"\bdeschis până la\b", t, flags=re.IGNORECASE):
+            return "🟢 Deschis", "Wolt UI: Deschis până la ora specificată"
+        # Se deschide la HH:MM
+        if re.search(r"\bse deschide la\b", t, flags=re.IGNORECASE):
+            return "🔴 Închis", "Wolt UI: Se deschide la ora specificată"
+        # Fallback pe câmp json (există pe unele pagini)
         if re.search(r'"is_open"\s*:\s*true', t):
             return "🟢 Deschis", "Wolt JSON is_open=true"
-        if re.search(r"\binchis\b", t) or re.search(r"\bclosed\b", t):
-            return "🔴 Închis", "Wolt UI: conține „închis/closed”"
-        return "🟡 Nedetectabil", "Wolt: is_open absent/nedetectabil"
+        if re.search(r'"is_open"\s*:\s*false', t):
+            return "🔴 Închis", "Wolt JSON is_open=false"
+        return "🟡 Nedetectabil", "Wolt: semnal UI/JSON absent"
 
     # ── fallback generic
     if re.search(r"\bclosed\b", t) or re.search(r"\binchis\b", t):
@@ -254,28 +235,34 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
     return "🟡 Nedetectabil", "Fără semnale în HTML"
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Motor de verificare
+# Fetch cu probă Bolt API (dacă se poate)
 # ────────────────────────────────────────────────────────────────────────────────
-last_full_check_time: str | None = None
-last_results: dict[str, dict] = {}   # key = url
 
-def fetch_status_and_reason(it: dict) -> tuple[str, str]:
-    url = it["url"]
-
-    # 1) BOLT: încearcă API-ul întâi
-    if "bolt.eu" in url:
-        api_res = bolt_api_probe(url)
-        if api_res is not None:
-            return api_res
-
-    # 2) HTML fallback (Bolt când API e None, Wolt întotdeauna)
+def fetch_status_and_reason(url: str) -> tuple[str, str]:
     try:
         r = requests.get(url, headers=HEADERS, timeout=12)
         if r.status_code >= 400:
             return f"🔴 Închis ({r.status_code})", f"HTTP {r.status_code}"
+
+        # Bolt: încercăm întâi API-ul, dacă avem provider_id
+        if "bolt.eu" in url:
+            pid = extract_bolt_provider_id(url)
+            if pid:
+                s, reason = probe_bolt_api(pid)
+                if s is not None:
+                    return s, reason
+
+        # altfel, clasificare din HTML
         return classify_with_reason(url, r.text)
+
     except Exception as e:
         return "❌ Eroare", f"Eroare rețea: {str(e)[:140]}"
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Motor de verificare
+# ────────────────────────────────────────────────────────────────────────────────
+last_full_check_time: str | None = None
+last_results: dict[str, dict] = {}   # key = url
 
 def check_all():
     global last_full_check_time, last_results
@@ -283,7 +270,7 @@ def check_all():
 
     out = {}
     with ThreadPoolExecutor(max_workers=12) as pool:
-        future_map = {pool.submit(fetch_status_and_reason, it): it for it in items}
+        future_map = {pool.submit(fetch_status_and_reason, it["url"]): it for it in items}
         for fut in as_completed(future_map):
             it = future_map[fut]
             status, reason = fut.result()
@@ -390,7 +377,7 @@ HTML_TEMPLATE = """<!doctype html>
 
     <div class="footer">
       Dacă un rând este „🟡 Nedetectabil”, cauza probabilă: pagina e SPA și nu oferă încă text server-side.
-      Pentru Bolt folosim API-ul lor public; dacă e indisponibil, revenim la HTML.
+      Pentru Bolt poți seta <code>ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT=true</code> ca fallback → „Închis”.
     </div>
   </div>
 
@@ -460,6 +447,7 @@ def index() -> Response:
     html = HTML_TEMPLATE.replace("__VERSION__", VERSION).replace("__INTERVAL__", str(CHECK_INTERVAL_SEC))
     return Response(html, mimetype="text/html")
 
+
 @app.route("/api/status")
 def api_status():
     items = []
@@ -485,10 +473,12 @@ def api_status():
         "items": items,
     })
 
+
 @app.route("/api/refresh", methods=["POST"])
 def api_refresh():
     check_all()
     return jsonify({"ok": True, "refreshed_at": now_str()})
+
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Pornire app + background checker
