@@ -1,6 +1,5 @@
 import os
 import re
-import json
 import html as html_lib
 import unicodedata
 import threading
@@ -17,7 +16,7 @@ from flask import Flask, jsonify, request, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.2.1 beta"
+VERSION = "v0.2.2 beta"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
@@ -42,9 +41,8 @@ HEADERS = {
 }
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Date: restaurante (Bolt + Wolt)
+# Date restaurante
 # ────────────────────────────────────────────────────────────────────────────────
-
 RESTAURANTS = [
     # BOLT
     {"platform": "Bolt", "location": "Burgers Militari", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
@@ -57,7 +55,7 @@ RESTAURANTS = [
     {"platform": "Bolt", "location": "Smash Pipera", "url": "https://food.bolt.eu/en-US/325-bucharest/p/157013-smash-gorilla/?utm_content=menu_header&utm_medium=product&utm_source=share_provider"},
     {"platform": "Bolt", "location": "Tacos Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/130672-gorilla's-crazy-tacos"},
 
-    # BOLT – TEST „deschis”
+    # BOLT – TEST
     {"platform": "Bolt", "location": "Test: Liquid Spirits", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/126569-liquid-spirits"},
 
     # WOLT
@@ -76,7 +74,7 @@ RESTAURANTS = [
 ]
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Utilități
+# Utilitare
 # ────────────────────────────────────────────────────────────────────────────────
 def now_str():
     return datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
@@ -103,7 +101,6 @@ def sort_key(item: dict):
         if k in loc:
             loc_score = v
             break
-    # Bolt în fața Wolt
     return (item["platform"] != "Bolt", b, loc_score, item["location"])
 
 def _normalize_html_text(s: str):
@@ -236,9 +233,12 @@ def wolt_check_via_api(url: str):
         return None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Fallback HTML
+# Fallback HTML (inclusiv pattern-urile Wolt din snippetul tău)
 # ────────────────────────────────────────────────────────────────────────────────
 def classify_html(url: str, html: str):
+    """
+    Returnează (status, motiv) doar pe baza HTML-ului.
+    """
     t, t_ascii = _normalize_html_text(html)
     avail_frag = _extract_availability_info_block(html)
     af_ascii = (
@@ -275,12 +275,28 @@ def classify_html(url: str, html: str):
         return "🟡 Nedetectabil", "Bolt: niciun semnal clar (nici closed, nici opens-at)"
 
     if "wolt.com" in url:
-        if re.search(r"\binchis\b", t) or re.search(r"\bclosed\b", t):
-            return "🔴 Închis", "Wolt UI: conține „închis/closed”"
+        # 1) Butonul „Programează o comandă” din VenueToolbar -> închis
+        if re.search(r'data-test-id="VenueToolbar\.DeliveryUnavailableStatusButton"', html):
+            return "🔴 Închis", "Wolt UI: ‘Programează o comandă’ (DeliveryUnavailableStatusButton)"
+
+        # 2) Badge-uri & fraze explicite
+        if re.search(r"\binchis\b", t) or re.search(r"\binchis\b", t_ascii):
+            return "🔴 Închis", "Wolt UI: ‘Închis’"
+        if re.search(r"\bse deschide la\b", t) or re.search(r"\bse deschide la\b", t_ascii):
+            return "🔴 Închis", "Wolt UI: ‘Se deschide la …’"
+
+        # 3) ‘Deschis până la …’ => deschis
+        if re.search(r"deschis p(?:â|a)na la \d{1,2}[:.]\d{2}", t) or re.search(r"deschis pana la \d{1,2}[:.]\d{2}", t_ascii):
+            return "🟢 Deschis", "Wolt UI: ‘Deschis până la …’"
+        if re.search(r"\bopen until\b", t_ascii):
+            return "🟢 Deschis", "Wolt UI: ‘Open until …’"
+
+        # 4) fallback moale
         if re.search(r"\bdeschis\b", t) or re.search(r"\bopen now\b", t_ascii):
-            return "🟢 Deschis", "Wolt UI: conține „deschis/open now”"
+            return "🟢 Deschis", "Wolt UI: ‘deschis/open now’"
         return "🟡 Nedetectabil", "Wolt: semnal UI/JSON absent"
 
+    # fallback generic
     if re.search(r"\bclosed\b", t) or re.search(r"\binchis\b", t):
         return "🔴 Închis", "Text generic: ‘closed/închis’"
     if re.search(r"\bopen now\b", t) or re.search(r"\bdeschis acum\b", t):
@@ -294,7 +310,7 @@ last_full_check_time = None
 last_results = {}   # key = url
 
 def fetch_status_and_reason(url: str):
-    # 1) API-uri directe
+    # 1) API direct
     if "bolt.eu" in url:
         r = bolt_check_via_api(url)
         if r:
@@ -476,8 +492,6 @@ function applyDetailMode() {
 
 function render(data) {
   $("#last-check").textContent = data.last_full_check || "—";
-
-  // ascunde rândurile de test în modul simplu
   const filtered = (data.items || []).filter(it => detailed || !it.is_test);
 
   const boltRows = [];
@@ -548,7 +562,6 @@ def api_status():
                 "checked_at": "—",
             })
         else:
-            # asigură că includem is_test și brand chiar dacă vin din cache
             out = {**r}
             out["is_test"] = base["is_test"]
             out["brand"] = base["brand"]
@@ -566,7 +579,6 @@ def api_refresh():
     check_all()
     return jsonify({"ok": True, "refreshed_at": now_str()})
 
-# Debug: vezi răspunsul brut al Wolt pentru un slug
 @app.route("/api/wolt/raw")
 def api_wolt_raw():
     slug = (request.args.get("slug") or "").strip()
@@ -581,7 +593,7 @@ def api_wolt_raw():
         return jsonify({"error": str(e)}), 500
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Pornire app + background checker
+# Pornire
 # ────────────────────────────────────────────────────────────────────────────────
 def _start_background():
     t = threading.Thread(target=background_loop, daemon=True)
