@@ -188,22 +188,39 @@ def classify_html(url: str, html: str):
             return "🔴 Închis", "Bolt: fallback ‘assume closed’"
         return "🟡 Nedetectabil", "Bolt: niciun semnal clar"
 
-    if "wolt.com" in url:
-        if re.search(r'data-test-id="VenueToolbar\.DeliveryUnavailableStatusButton"', html):
-            return "🔴 Închis", "Wolt UI: ‘DeliveryUnavailableStatusButton’"
-        if "închis" in t or "se deschide la" in t:
-            return "🔴 Închis", "Wolt UI: ‘Închis / Se deschide la …’"
-        if re.search(r"deschis p(?:â|a)na la \d{1,2}[:.]\d{2}", t) or re.search(r"open until", t_ascii):
-            return "🟢 Deschis", "Wolt UI: ‘Deschis până la …’"
-        if "deschis" in t or "open now" in t_ascii:
-            return "🟢 Deschis", "Wolt UI: ‘Deschis / Open now’"
-        return "🟡 Nedetectabil", "Wolt UI: fără semnal clar"
 
-    if re.search(r"\bclosed\b", t) or re.search(r"\binchis\b", t):
-        return "🔴 Închis", "Text generic: ‘closed/închis’"
-    if re.search(r"\bopen now\b", t) or re.search(r"\bdeschis acum\b", t):
-        return "🟢 Deschis", "Text generic: ‘open now/deschis acum’"
-    return "🟡 Nedetectabil", "Fără semnale în HTML"
+
+
+
+
+
+    if "wolt.com" in url:
+        # 1) Butonul „Programează o comandă” din VenueToolbar -> închis
+        if re.search(r'data-test-id="VenueToolbar\.DeliveryUnavailableStatusButton"', html):
+            return "🔴 Închis", "Wolt UI: ‘Programează o comandă’ (DeliveryUnavailableStatusButton)"
+
+        # Normalizări pentru căutări engleză/română
+        # t = lower cu diacritice; t_ascii = lower fără diacritice (ai deja mai sus)
+        # —— Semnale clare de ÎNCHIS
+        if re.search(r"\bînchis\b", t) or re.search(r"\bclosed\b", t_ascii):
+            return "🔴 Închis", "Wolt UI: ‘Închis/Closed’"
+        if re.search(r"\bse deschide la\b", t) or re.search(r"\bopens?\s+at\b", t_ascii):
+            return "🔴 Închis", "Wolt UI: ‘Se deschide la/Opens at …’"
+
+        # —— Semnale clare de DESCHIS
+        # ‘Deschis până la …’ (română) sau ‘Open until …’ (engleză)
+        if re.search(r"deschis\s+p(?:â|a)na\s+la\s+\d{1,2}[:.]\d{2}", t):
+            return "🟢 Deschis", "Wolt UI: ‘Deschis până la …’"
+        if re.search(r"\bopen\s+until\s+\d{1,2}[:.]\d{2}", t_ascii) \
+           or re.search(r"\bopen\s+till\s+\d{1,2}[:.]\d{2}", t_ascii) \
+           or re.search(r"\bopen\s+until\b", t_ascii):  # fallback dacă ora lipsește
+            return "🟢 Deschis", "Wolt UI: ‘Open until …’"
+
+        # Semnale mai slabe de deschis
+        if re.search(r"\bdeschis\b", t) or re.search(r"\bopen now\b", t_ascii) or re.search(r"\bopen\b", t_ascii):
+            return "🟢 Deschis", "Wolt UI: ‘deschis/open’"
+
+        return "🟡 Nedetectabil", "Wolt: semnal UI/JSON absent"
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Motor de verificare
