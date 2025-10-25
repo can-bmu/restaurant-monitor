@@ -1,13 +1,14 @@
 import os
 import re
 import html as html_lib
+import json
 import unicodedata
 import threading
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
+from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from uuid import uuid4
 
 import requests
 from flask import Flask, jsonify, Response
@@ -15,13 +16,16 @@ from flask import Flask, jsonify, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.1.7 beta"
+VERSION = "v0.2.1 beta"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
 ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT = os.getenv(
     "ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT", "false"
 ).lower() in ("1", "true", "yes")
+
+REQ_TIMEOUT = (4, 6)  # (connect, read) seconds
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "6"))
 
 HEADERS = {
     "User-Agent": (
@@ -37,7 +41,7 @@ HEADERS = {
 # ────────────────────────────────────────────────────────────────────────────────
 
 RESTAURANTS = [
-    # BOLT (Gorilla’s)
+    # BOLT
     {"platform": "Bolt", "location": "Burgers Militari",  "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/53203"},
     {"platform": "Bolt", "location": "Smash Militari",    "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/157022-smash-gorilla/info"},
     {"platform": "Bolt", "location": "Burgers Olteniței", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/81061-gorilla's-crazy-burgers-berceni"},
@@ -47,11 +51,10 @@ RESTAURANTS = [
     {"platform": "Bolt", "location": "Burgers Pipera",    "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/122872-gorilla's-crazy-burgers-pipera"},
     {"platform": "Bolt", "location": "Smash Pipera",      "url": "https://food.bolt.eu/en-US/325-bucharest/p/157013-smash-gorilla/?utm_content=menu_header&utm_medium=product&utm_source=share_provider"},
     {"platform": "Bolt", "location": "Tacos Olteniței",   "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/130672-gorilla's-crazy-tacos"},
-
-    # BOLT – TEST (deschis)
+    # BOLT – test deschis
     {"platform": "Bolt", "location": "Test: Liquid Spirits", "url": "https://food.bolt.eu/ro-RO/325-bucharest/p/126569-liquid-spirits"},
 
-    # WOLT (Gorilla’s)
+    # WOLT
     {"platform": "Wolt", "location": "Burgers Militari",  "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-burgers-gorjului-67dc3f47b93a5300e8efd705"},
     {"platform": "Wolt", "location": "Smash Militari",    "url": "https://wolt.com/ro/rou/bucharest/restaurant/smash-gorilla-gorjului-6880a63946c4278a97069f59"},
     {"platform": "Wolt", "location": "Burgers Olteniței", "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-oltenitei-67e189430bd3fc375bb3acc8"},
@@ -61,8 +64,7 @@ RESTAURANTS = [
     {"platform": "Wolt", "location": "Burgers Pipera",    "url": "https://wolt.com/ro/rou/bucharest/restaurant/gorillas-crazy-burgers-pipera-67e189430bd3fc375bb3acc9"},
     {"platform": "Wolt", "location": "Smash Pipera",      "url": "https://wolt.com/en/rou/bucharest/restaurant/smash-gorilla-pipera-6880a32754547abea1869ced"},
     {"platform": "Wolt", "location": "Tacos Olteniței",   "url": "https://wolt.com/en/rou/bucharest/restaurant/gorillas-crazy-tacos-berceni-67db0092e014794baf59070a"},
-
-    # WOLT – TEST (deschis)
+    # WOLT – test deschis
     {"platform": "Wolt", "location": "Test: Shaormeria CA", "url": "https://wolt.com/ro/rou/bucharest/restaurant/shaormeria-ca-67dc3efb2e58c74a8f3511df"},
 ]
 
@@ -100,6 +102,158 @@ def _normalize_html_text(s: str) -> tuple[str, str]:
     s_ascii = unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
     return s, s_ascii
 
+# ────────────────────────────────────────────────────────────────────────────────
+# BOLT helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+BOLT_AVAIL_URL = "https://deliveryuser.live.boltsvc.net/deliveryClient/public/getProviderAvailabilityStatus"
+
+def bolt_provider_id_from_url(url: str) -> str | None:
+    # caută /p/<id> sau /p/<id>-slug
+    m = re.search(r"/p/(\d+)(?:[^\d]|$)", url)
+    if m:
+        return m.group(1)
+    return None
+
+def bolt_check_availability(url: str) -> tuple[str, str] | None:
+    provider_id = bolt_provider_id_from_url(url)
+    if not provider_id:
+        return None
+
+    params = {
+        "provider_id": provider_id,
+        "version": "FW.1.98",
+        "language": "ro-RO",
+        "session_id": "sess-" + provider_id,
+        "distinct_id": "dev-" + provider_id,
+        "country": "ro",
+        "device_name": "web",
+        "device_os_version": "web",
+        "deviceId": "dev-" + provider_id,
+        "deviceType": "web",
+    }
+    try:
+        r = requests.get(BOLT_AVAIL_URL, headers=HEADERS, params=params, timeout=REQ_TIMEOUT)
+        if r.status_code >= 400:
+            return None
+        data = r.json().get("data", {})
+        d = bool(data.get("is_available_for_delivery"))
+        t = bool(data.get("is_available_for_takeaway"))
+        sd = bool(data.get("is_available_for_schedule_delivery"))
+        st = bool(data.get("is_available_for_schedule_takeaway"))
+        overlay = data.get("provider_overlay_text", {})
+        snack = data.get("provider_snackbar_text", {})
+        overlay_txt = overlay.get("value") if isinstance(overlay, dict) else None
+        snack_txt = snack.get("value") if isinstance(snack, dict) else None
+
+        if any([d, t, sd, st]):
+            reason = "Bolt API: disponibil"
+            flags = []
+            if d:  flags.append("delivery")
+            if t:  flags.append("takeaway")
+            if sd: flags.append("schedule_delivery")
+            if st: flags.append("schedule_takeaway")
+            if flags:
+                reason += " (" + ", ".join(flags) + ")"
+            if overlay_txt:
+                reason += f" • {overlay_txt}"
+            if snack_txt and snack_txt != overlay_txt:
+                reason += f" • {snack_txt}"
+            return "🟢 Deschis", reason
+        else:
+            # Închis, eventual cu message tip „Deschide la …”
+            msg = "Bolt API: indisponibil"
+            if overlay_txt:
+                msg += f" • {overlay_txt}"
+            if snack_txt and snack_txt != overlay_txt:
+                msg += f" • {snack_txt}"
+            return "🔴 Închis", msg
+    except Exception:
+        return None
+
+# ────────────────────────────────────────────────────────────────────────────────
+# WOLT helpers
+# ────────────────────────────────────────────────────────────────────────────────
+
+def wolt_slug_from_url(url: str) -> str | None:
+    """
+    Extrage slug-ul după '/restaurant/'.
+    Ex: https://wolt.com/.../restaurant/shaormeria-ca-67dc...  -> 'shaormeria-ca-67dc...'
+    """
+    try:
+        path = urlparse(url).path
+        if "/restaurant/" in path:
+            return path.split("/restaurant/")[-1].strip("/ ")
+    except Exception:
+        pass
+    return None
+
+def wolt_check_via_api(url: str) -> tuple[str, str] | None:
+    slug = wolt_slug_from_url(url)
+    if not slug:
+        return None
+    api = f"https://restaurant-api.wolt.com/v1/pages/venue/{slug}"
+    try:
+        r = requests.get(api, headers=HEADERS, timeout=REQ_TIMEOUT)
+        if r.status_code >= 400:
+            return None
+        data = r.json()
+        # Căutăm mai multe posibile căi pentru flag-ul open:
+        # 1) data['venue']['is_open']
+        # 2) data['venue']['online']
+        # 3) data['page']['data']['venue']['open'] / 'online'
+        # 4) data['page']['data']['sections'] ... (fallback)
+        def deep_get(obj, keys, default=None):
+            cur = obj
+            for k in keys:
+                if isinstance(cur, dict) and k in cur:
+                    cur = cur[k]
+                else:
+                    return default
+            return cur
+
+        candidates = [
+            ("is_open", deep_get(data, ["venue", "is_open"])),
+            ("online", deep_get(data, ["venue", "online"])),
+            ("is_open", deep_get(data, ["page", "data", "venue", "is_open"])),
+            ("online", deep_get(data, ["page", "data", "venue", "online"])),
+            ("delivery_open_status", deep_get(data, ["venue", "delivery_open_status"])),
+            ("delivery_open_status", deep_get(data, ["page", "data", "venue", "delivery_open_status"])),
+        ]
+
+        # Normalizează statusul
+        for key, val in candidates:
+            if val is None:
+                continue
+            # bool direct
+            if isinstance(val, bool):
+                if val:
+                    return "🟢 Deschis", f"Wolt API: {key}=true"
+                else:
+                    return "🔴 Închis", f"Wolt API: {key}=false"
+            # string ex: 'OPEN', 'CLOSED'
+            if isinstance(val, str):
+                v = val.upper()
+                if v in ("OPEN", "ONLINE", "OPEN_FOR_DELIVERIES"):
+                    return "🟢 Deschis", f"Wolt API: {key}={val}"
+                if v in ("CLOSED", "OFFLINE", "CLOSED_FOR_DELIVERIES"):
+                    return "🔴 Închis", f"Wolt API: {key}={val}"
+
+        # uneori există un banner textual „Se deschide la … / Deschis până la …”
+        text_candidates = json.dumps(data, ensure_ascii=False).lower()
+        if "se deschide la" in text_candidates or "deschide la" in text_candidates:
+            return "🔴 Închis", "Wolt API: „Se deschide la …”"
+        if "deschis până la" in text_candidates or "open until" in text_candidates:
+            return "🟢 Deschis", "Wolt API: „Deschis până la …”"
+
+        return None
+    except Exception:
+        return None
+
+# ────────────────────────────────────────────────────────────────────────────────
+# Heuristici HTML (fallback)
+# ────────────────────────────────────────────────────────────────────────────────
+
 def _extract_availability_info_block(t: str) -> str | None:
     m = re.search(
         r'data-testid="screens\.Provider\.MenuHeader\.availabilityInfo"[^>]*>(.*?)</div>',
@@ -113,62 +267,9 @@ def _extract_availability_info_block(t: str) -> str | None:
     frag = re.sub(r"\s+", " ", frag)
     return frag
 
-def extract_bolt_provider_id(url: str) -> str | None:
-    m = re.search(r"/p/(\d+)", url)
-    return m.group(1) if m else None
-
-def probe_bolt_api(provider_id: str) -> tuple[str | None, str | None]:
+def classify_with_reason_fallback(url: str, html: str) -> tuple[str, str]:
     """
-    Întoarce (status, motiv) sau (None, None) dacă nu reușește.
-    """
-    try:
-        params = {
-            "provider_id": provider_id,
-            "version": "FW.1.98",
-            "language": "ro-RO",
-            "country": "ro",
-            "device_name": "web",
-            "device_os_version": "web",
-            "deviceId": str(uuid4()),
-            "deviceType": "web",
-        }
-        r = requests.get(
-            "https://deliveryuser.live.boltsvc.net/deliveryClient/public/getProviderAvailabilityStatus",
-            params=params,
-            headers=HEADERS,
-            timeout=12,
-        )
-        j = r.json()
-        data = j.get("data") or {}
-        # considerăm deschis dacă oricare dintre flagurile "is_available_*" e True
-        flags = [
-            data.get("is_available_for_delivery"),
-            data.get("is_available_for_takeaway"),
-            data.get("is_available_for_schedule_delivery"),
-            data.get("is_available_for_schedule_takeaway"),
-        ]
-        overlay = (data.get("provider_overlay_text") or {}).get("value")
-        snack = (data.get("provider_snackbar_text") or {}).get("value")
-
-        if any(f is True for f in flags):
-            reason = "Bolt API: disponibil (delivery/takeaway/schedule)"
-            if overlay:
-                reason += f" — {overlay}"
-            return "🟢 Deschis", reason
-
-        if all(f is False for f in flags):
-            msg = overlay or snack or "indisponibil"
-            return "🔴 Închis", f"Bolt API: {msg}"
-
-        # altfel nedeterminabil
-        return "🟡 Nedetectabil", "Bolt API: răspuns neconcludent"
-    except Exception:
-        return None, None
-
-def classify_with_reason(url: str, html: str) -> tuple[str, str]:
-    """
-    Returnează (status, motiv).
-    Status: '🔴 Închis', '🟢 Deschis', '🟡 Nedetectabil', '❌ Eroare'
+    Fallback pe HTML pentru ambele platforme.
     """
     t, t_ascii = _normalize_html_text(html)
     avail_frag = _extract_availability_info_block(html)
@@ -178,14 +279,11 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
         else None
     )
 
-    # ── BOLT (fallback pe HTML/UI dacă nu avem API sau API nu dă concluzie)
     if "bolt.eu" in url:
         if re.search(r'"availabilitystatus"\s*:\s*"closed"', t):
             return "🔴 Închis", "Bolt JSON availabilityStatus=closed"
-
         if re.search(r'aria-label="[^"]*(închis|temporar|closed)[^"]*"', html, flags=re.IGNORECASE):
             return "🔴 Închis", "Bolt aria-label: conține 'închis/temporar/closed'"
-
         if avail_frag:
             if re.search(r"\binchis temporar\b", avail_frag) or (af_ascii and re.search(r"\binchis temporar\b", af_ascii)):
                 return "🔴 Închis", "Bolt availabilityInfo: „Închis temporar”"
@@ -196,38 +294,22 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
             if re.search(r"\btemporarily closed\b", avail_frag) or (af_ascii and re.search(r"\btemporarily closed\b", af_ascii)):
                 return "🔴 Închis", "Bolt availabilityInfo: „temporarily closed”"
 
-        if re.search(r"\binchis temporar\b", t) or re.search(r"\binchis temporar\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Închis temporar”"
-        if re.search(r"\binchis\b", t) or re.search(r"\binchis\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Închis”"
-        if re.search(r"\btemporarily closed\b", t) or re.search(r"\btemporarily closed\b", t_ascii):
-            return "🔴 Închis", "Bolt UI: „temporarily closed”"
-        if re.search(r"deschide la \d{1,2}[:.]\d{2}", t) or re.search(r"deschide la \d{1,2}[:.]\d{2}", t_ascii):
-            return "🔴 Închis", "Bolt UI: „Deschide la HH:MM”"
-
         if ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT:
             return "🔴 Închis", "Bolt: fallback ‘assume closed’ (nedetectabil)"
         return "🟡 Nedetectabil", "Bolt: niciun semnal clar (nici closed, nici opens-at)"
 
-    # ── WOLT (detectare din UI, stabil pe HTML server-side)
     if "wolt.com" in url:
-        # Închis (badge “Închis” lângă rating / bară aflată sub header)
-        if re.search(r"\bînchis\b", t, flags=re.IGNORECASE):
-            return "🔴 Închis", "Wolt UI: Închis"
-        # Deschis (apare “Deschis până la HH:MM”)
-        if re.search(r"\bdeschis până la\b", t, flags=re.IGNORECASE):
-            return "🟢 Deschis", "Wolt UI: Deschis până la ora specificată"
-        # Se deschide la HH:MM
-        if re.search(r"\bse deschide la\b", t, flags=re.IGNORECASE):
-            return "🔴 Închis", "Wolt UI: Se deschide la ora specificată"
-        # Fallback pe câmp json (există pe unele pagini)
-        if re.search(r'"is_open"\s*:\s*true', t):
-            return "🟢 Deschis", "Wolt JSON is_open=true"
         if re.search(r'"is_open"\s*:\s*false', t):
             return "🔴 Închis", "Wolt JSON is_open=false"
+        if re.search(r'"is_open"\s*:\s*true', t):
+            return "🟢 Deschis", "Wolt JSON is_open=true"
+        if re.search(r"\binchis\b", t) or re.search(r"\bclosed\b", t):
+            return "🔴 Închis", "Wolt UI: conține „închis/closed”"
+        if re.search(r"\bdeschis\b", t) or re.search(r"\bopen now\b", t):
+            return "🟢 Deschis", "Wolt UI: conține „deschis/open now”"
         return "🟡 Nedetectabil", "Wolt: semnal UI/JSON absent"
 
-    # ── fallback generic
+    # fallback generic
     if re.search(r"\bclosed\b", t) or re.search(r"\binchis\b", t):
         return "🔴 Închis", "Text generic: ‘closed/închis’"
     if re.search(r"\bopen now\b", t) or re.search(r"\bdeschis acum\b", t):
@@ -235,26 +317,26 @@ def classify_with_reason(url: str, html: str) -> tuple[str, str]:
     return "🟡 Nedetectabil", "Fără semnale în HTML"
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Fetch cu probă Bolt API (dacă se poate)
+# Clasificator principal (cu API-uri + fallback)
 # ────────────────────────────────────────────────────────────────────────────────
 
-def fetch_status_and_reason(url: str) -> tuple[str, str]:
+def classify_with_reason(url: str) -> tuple[str, str]:
+    # 1) Încearcă API specializat
+    if "bolt.eu" in url:
+        api_res = bolt_check_availability(url)
+        if api_res:
+            return api_res
+    elif "wolt.com" in url:
+        api_res = wolt_check_via_api(url)
+        if api_res:
+            return api_res
+
+    # 2) Fallback: HTML
     try:
-        r = requests.get(url, headers=HEADERS, timeout=12)
+        r = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
         if r.status_code >= 400:
-            return f"🔴 Închis ({r.status_code})", f"HTTP {r.status_code}"
-
-        # Bolt: încercăm întâi API-ul, dacă avem provider_id
-        if "bolt.eu" in url:
-            pid = extract_bolt_provider_id(url)
-            if pid:
-                s, reason = probe_bolt_api(pid)
-                if s is not None:
-                    return s, reason
-
-        # altfel, clasificare din HTML
-        return classify_with_reason(url, r.text)
-
+            return (f"🔴 Închis ({r.status_code})", f"HTTP {r.status_code}")
+        return classify_with_reason_fallback(url, r.text)
     except Exception as e:
         return "❌ Eroare", f"Eroare rețea: {str(e)[:140]}"
 
@@ -264,12 +346,18 @@ def fetch_status_and_reason(url: str) -> tuple[str, str]:
 last_full_check_time: str | None = None
 last_results: dict[str, dict] = {}   # key = url
 
+def fetch_status_and_reason(url: str) -> tuple[str, str]:
+    try:
+        return classify_with_reason(url)
+    except Exception as e:
+        return "❌ Eroare", f"Eroare internă: {str(e)[:140]}"
+
 def check_all():
     global last_full_check_time, last_results
     items = sorted(RESTAURANTS, key=sort_key)
 
     out = {}
-    with ThreadPoolExecutor(max_workers=12) as pool:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
         future_map = {pool.submit(fetch_status_and_reason, it["url"]): it for it in items}
         for fut in as_completed(future_map):
             it = future_map[fut]
@@ -299,7 +387,7 @@ def background_loop():
             pass
 
 # ────────────────────────────────────────────────────────────────────────────────
-# Web
+# Web (UI cu comutator Simplu/Detaliat)
 # ────────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -335,6 +423,7 @@ HTML_TEMPLATE = """<!doctype html>
     .footer { margin-top:18px; color:var(--muted); font-size:12px; }
     .version { margin-left:auto; background:#23313a; color:#9cc5b3; padding:2px 8px; border-radius:999px; font-size:12px; }
     .headerline { display:flex; gap:12px; align-items:center; }
+    .hide { display:none; }
   </style>
 </head>
 <body>
@@ -350,6 +439,7 @@ HTML_TEMPLATE = """<!doctype html>
       <span>•</span>
       <span>Interval verificare: <b>__INTERVAL__s</b></span>
       <button id="refresh" class="btn" style="margin-left:12px">Reverifică acum</button>
+      <button id="toggleView" class="btn" style="background:#2c3e50">Teste</button>
     </div>
 
     <div class="grid">
@@ -358,7 +448,12 @@ HTML_TEMPLATE = """<!doctype html>
         <div class="muted" style="padding:0 18px 8px;">Ordonare: Burgers → Smash → Tacos, apoi locații</div>
         <table id="bolt">
           <thead>
-            <tr><th>Locație</th><th>Status</th><th>Motiv</th><th>Verificat la</th></tr>
+            <tr>
+              <th>Locație</th>
+              <th>Status</th>
+              <th class="col-detail">Motiv</th>
+              <th class="col-detail">Verificat la</th>
+            </tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -368,7 +463,12 @@ HTML_TEMPLATE = """<!doctype html>
         <h2>Wolt</h2>
         <table id="wolt">
           <thead>
-            <tr><th>Locație</th><th>Status</th><th>Motiv</th><th>Verificat la</th></tr>
+            <tr>
+              <th>Locație</th>
+              <th>Status</th>
+              <th class="col-detail">Motiv</th>
+              <th class="col-detail">Verificat la</th>
+            </tr>
           </thead>
           <tbody></tbody>
         </table>
@@ -376,13 +476,25 @@ HTML_TEMPLATE = """<!doctype html>
     </div>
 
     <div class="footer">
-      Dacă un rând este „🟡 Nedetectabil”, cauza probabilă: pagina e SPA și nu oferă încă text server-side.
+      Dacă un rând este „🟡 Nedetectabil”, cauza probabilă: pagina e SPA și nu oferă text server-side.
       Pentru Bolt poți seta <code>ASSUME_CLOSED_WHEN_UNCERTAIN_BOLT=true</code> ca fallback → „Închis”.
     </div>
   </div>
 
 <script>
 const $ = (sel) => document.querySelector(sel);
+let detailed = false;
+
+function setDetailed(on) {
+  detailed = !!on;
+  document.querySelectorAll(".col-detail").forEach(el => {
+    el.style.display = detailed ? "" : "none";
+  });
+  // ascunde și celulele corespunzătoare
+  document.querySelectorAll("td.t-detail").forEach(el => {
+    el.style.display = detailed ? "" : "none";
+  });
+}
 
 function badge(cls, text) {
   return '<span class="status ' + cls + '">' + text + '</span>';
@@ -398,8 +510,8 @@ function rowHTML(it) {
   html += '<td><a href="' + it.url + '" target="_blank" rel="noreferrer">' +
           it.location + '</a> <span class="chip">' + it.brand + '</span></td>';
   html += '<td>' + badge(cls, it.status) + '</td>';
-  html += '<td class="muted">' + it.reason + '</td>';
-  html += '<td class="muted">' + it.checked_at + '</td>';
+  html += '<td class="muted t-detail" style="' + (detailed ? '' : 'display:none') + '">' + (it.reason || '—') + '</td>';
+  html += '<td class="muted t-detail" style="' + (detailed ? '' : 'display:none') + '">' + (it.checked_at || '—') + '</td>';
   html += '</tr>';
   return html;
 }
@@ -435,6 +547,11 @@ $("#refresh").addEventListener("click", async function() {
   btn.textContent = "Reverifică acum";
 });
 
+$("#toggleView").addEventListener("click", function() {
+  setDetailed(!detailed);
+});
+
+setDetailed(false);
 load();
 setInterval(load, 30000);
 </script>
@@ -490,4 +607,6 @@ def _start_background():
 _start_background()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    # Local dev
+    port = int(os.getenv("PORT", "8000"))
+    app.run(host="0.0.0.0", port=port)
