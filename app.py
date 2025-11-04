@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import html as html_lib
 import unicodedata
 import threading
@@ -16,7 +17,7 @@ from flask import Flask, jsonify, request, Response
 # ────────────────────────────────────────────────────────────────────────────────
 # Config
 # ────────────────────────────────────────────────────────────────────────────────
-VERSION = "v0.2.3"
+VERSION = "v0.3.0"
 TZ = ZoneInfo("Europe/Bucharest")
 
 CHECK_INTERVAL_SEC = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
@@ -161,7 +162,61 @@ def bolt_check_via_api(url: str):
         return None
 
 # ────────────────────────────────────────────────────────────────────────────────
-# HTML Classifier (inclusiv pentru Wolt)
+# Wolt: extragere din __NEXT_DATA__ (robust)
+# ────────────────────────────────────────────────────────────────────────────────
+def wolt_state_from_next_data(html: str):
+    """
+    Extrage 'online' și 'venue_state' din __NEXT_DATA__ al paginii Wolt.
+    Returnează tuple (status, reason) sau None dacă nu poate decide.
+    """
+    m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(\{.*?\})</script>', html, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return None
+
+    # Variante comune pentru poziția datelor
+    props = (data.get("props") or {})
+    page_props = props.get("pageProps") or {}
+    candidates = []
+
+    if isinstance(page_props, dict):
+        if "venue" in page_props and isinstance(page_props["venue"], dict):
+            candidates.append(page_props["venue"])
+        # „fallback”/„dehydratedState”/„apolloState” — scan heuristic
+        for k in ("initialState", "apolloState", "dehydratedState", "fallback"):
+            if k in page_props and isinstance(page_props[k], dict):
+                for v in page_props[k].values():
+                    if isinstance(v, dict) and ("venue_state" in v or "online" in v):
+                        candidates.append(v)
+
+    # în unele build-uri, există și page_state. Îl verificăm separat
+    page_state = (data.get("page_state") or {})
+    if isinstance(page_state, dict) and ("venue_state" in page_state or "online" in page_state):
+        candidates.append(page_state)
+
+    # Interpretare conservatoare
+    for v in candidates:
+        try:
+            online = v.get("online")
+            venue_state = v.get("venue_state")
+            if online is False:
+                return "🔴 Închis", "Wolt NEXT_DATA: online=False"
+            if isinstance(venue_state, str) and "CLOSED" in venue_state.upper():
+                return "🔴 Închis", f"Wolt NEXT_DATA: venue_state={venue_state}"
+            if online is True:
+                return "🟢 Deschis", "Wolt NEXT_DATA: online=True"
+            if isinstance(venue_state, str) and ("OPEN" in venue_state.upper() or "NORMAL_OPEN" in venue_state.upper()):
+                return "🟢 Deschis", f"Wolt NEXT_DATA: venue_state={venue_state}"
+        except Exception:
+            continue
+
+    return None
+
+# ────────────────────────────────────────────────────────────────────────────────
+# HTML Classifier (fallback, inclusiv pentru Wolt)
 # ────────────────────────────────────────────────────────────────────────────────
 def classify_html(url: str, html: str):
     t, t_ascii = _normalize_html_text(html)
@@ -188,23 +243,21 @@ def classify_html(url: str, html: str):
             return "🔴 Închis", "Bolt: fallback ‘assume closed’"
         return "🟡 Nedetectabil", "Bolt: niciun semnal clar"
 
-
-
-
-
-
-
     if "wolt.com" in url:
+        # Semnale clare de ÎNCHIS
         if re.search(r'data-test-id="VenueToolbar\.DeliveryUnavailableStatusButton"', html):
             return "🔴 Închis", "Wolt UI: ‘DeliveryUnavailableStatusButton’"
-        if "închis" in t or "se deschide la" in t:
+        if re.search(r"\b(se deschide la|închis)\b", t):
             return "🔴 Închis", "Wolt UI: ‘Închis / Se deschide la …’"
-        if re.search(r"deschis p(?:â|a)na la \d{1,2}[:.]\d{2}", t) or re.search(r"open until", t_ascii):
+
+        # Semnale clare de DESCHIS (acceptăm doar „deschis până la …” sau „open until …”)
+        if re.search(r"deschis p(?:â|a)na la \d{1,2}[:.]\d{2}", t) or re.search(r"\bopen until\b", t_ascii):
             return "🟢 Deschis", "Wolt UI: ‘Deschis până la …’"
-        if "deschis" in t or "open now" in t_ascii:
-            return "🟢 Deschis", "Wolt UI: ‘Deschis / Open now’"
+
+        # NU folosim „open now/deschis” simplu — dă fals pozitive
         return "🟡 Nedetectabil", "Wolt UI: fără semnal clar"
 
+    # Fallback generic
     if re.search(r"\bclosed\b", t) or re.search(r"\binchis\b", t):
         return "🔴 Închis", "Text generic: ‘closed/închis’"
     if re.search(r"\bopen now\b", t) or re.search(r"\bdeschis acum\b", t):
@@ -218,17 +271,29 @@ last_full_check_time = None
 last_results = {}
 
 def fetch_status_and_reason(url: str):
+    # 1) Bolt → API oficial
     if "bolt.eu" in url:
         r = bolt_check_via_api(url)
         if r:
             return r
 
-    # Wolt → doar HTML
+    # 2) Pentru ambele platforme → HTML fetch
     try:
         resp = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
         if resp.status_code >= 400:
             return f"🔴 Închis ({resp.status_code})", f"HTTP {resp.status_code}"
-        return classify_html(url, resp.text)
+
+        html = resp.text
+
+        # 3) Wolt → încearcă mai întâi să citești __NEXT_DATA__ (cea mai robustă metodă)
+        if "wolt.com" in url:
+            r = wolt_state_from_next_data(html)
+            if r:
+                return r  # prioritate maximă: semnal din __NEXT_DATA__
+
+        # 4) Fallback: clasificator pe HTML
+        return classify_html(url, html)
+
     except Exception as e:
         return "❌ Eroare", f"Eroare rețea: {str(e)[:140]}"
 
@@ -265,7 +330,6 @@ def background_loop():
             check_all()
         except Exception:
             pass
-
 
 # ────────────────────────────────────────────────────────────────────────────────
 # Web
@@ -485,6 +549,8 @@ def api_refresh():
 
 @app.route("/api/wolt/raw")
 def api_wolt_raw():
+    # Endpoint păstrat pentru debugging. Nu toate slug-urile răspund aici,
+    # de aceea codul principal se bazează pe __NEXT_DATA__.
     slug = (request.args.get("slug") or "").strip()
     if not slug:
         return jsonify({"error":"missing slug"}), 400
@@ -506,4 +572,5 @@ def _start_background():
 _start_background()
 
 if __name__ == "__main__":
+    # Setează PORT=8000 (sau altul) în env
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
